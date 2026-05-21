@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright     "DevyyTrades"
 #property link          "https://devyytrades.com"
-#property version       "2.00"
+#property version       "2.01"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -26,6 +26,7 @@ input int    InpSlippage      = 30;
 
 input group "=== Filters ==="
 input bool   InpCheckExpiry   = true;
+input bool   InpDivergenceFix = true;  // Adjust entry/SL/TP for TW vs MT5 price diff
 
 //+------------------------------------------------------------------+
 //| GLOBALS                                                          |
@@ -36,6 +37,7 @@ int         g_executedCount = 0;
 string      g_pendingIds[1000];
 int         g_pendingCount  = 0;
 int         g_exportCounter = 0;
+int         g_signalTimeframe = 15;  // All proposals are on 15m TF
 
 //+------------------------------------------------------------------+
 //| Init                                                             |
@@ -123,6 +125,20 @@ void OnTimer()
       double tp      = JsonDbl(p, "tp");
       double lots    = JsonDbl(p, "lots");
       long   expires = (long)JsonDbl(p, "expires_at_unix");
+      long   barTimeMs = (long)JsonDbl(p, "bar_time");  // Unix ms from proposal
+      
+      // ============================================================
+      // DUPLICATE PROTECTION: Check if this setup already has an
+      // active order or open position on MT5 (survives restart)
+      // ============================================================
+      if(HasOrderForSetupId(setupId))
+        {
+         Print("[EA_Dumb] DUPLICATE GUARD: ", setupId, " already in MT5 history - skipping + cleanup");
+         // Try to clean up stale proposal from server (in case PostExecute failed earlier)
+         PostExecute(setupId);
+         SessionAdd(g_executedIds, g_executedCount, setupId);
+         continue;
+        }
       
       // Skip already executed this session
       if(SessionHas(g_executedIds, g_executedCount, setupId)) continue;
@@ -148,17 +164,43 @@ void OnTimer()
             continue;
            }
          
-         bool ok = PlaceOrder(symbol, dir, entry, sl, tp, setupId, lots);
+         // ============================================================
+         // PRICE DIVERGENCE FIX: Adjust entry/SL/TP for TW vs MT5 diff
+         // ============================================================
+         double adjEntry = entry;
+         double adjSl    = sl;
+         double adjTp    = tp;
+         double divergence = 0.0;
+         
+         if(InpDivergenceFix && barTimeMs > 0)
+           {
+            divergence = GetDivergence(symbol, entry, barTimeMs);
+            if(divergence != 0.0)
+              {
+               adjEntry = entry - divergence;
+               adjSl    = sl - divergence;
+               adjTp    = tp - divergence;
+               Print("[EA_Dumb] DIVERGENCE: ", symbol, " TW_open=", entry, " MT5_open=", entry-divergence, " diff=", divergence, " -> adj entry=", adjEntry, " adjSL=", adjSl, " adjTP=", adjTp);
+              }
+            else
+              {
+               Print("[EA_Dumb] DIVERGENCE: ", symbol, " could not get MT5 candle open - using original levels");
+              }
+           }
+         
+         bool ok = PlaceOrder(symbol, dir, adjEntry, adjSl, adjTp, setupId, lots);
          if(ok)
            {
             SessionAdd(g_executedIds, g_executedCount, setupId);
             SessionAdd(g_pendingIds, g_pendingCount, setupId);
             PostExecute(setupId);
-            Print("[EA_Dumb] PLACED ", setupId, " ", symbol, " ", dir, " entry=", entry);
+            Print("[EA_Dumb] PLACED ", setupId, " ", symbol, " ", dir, " entry=", adjEntry, " (divergence=", divergence, ")");
            }
          else
            {
-            Print("[EA_Dumb] FAILED ", setupId, " ", symbol, " ", dir, " entry=", entry);
+            Print("[EA_Dumb] FAILED ", setupId, " ", symbol, " ", dir, " entry=", adjEntry);
+            // Even on failure, add to executed to prevent re-trying the same setup
+            SessionAdd(g_executedIds, g_executedCount, setupId);
            }
         }
       else if(action == "cancel")
@@ -171,6 +213,114 @@ void OnTimer()
      }
    
    Print("[EA_Dumb] Listening... (", count, " proposals checked)");
+  }
+
+//+------------------------------------------------------------------+
+//| GetDivergence — compute TW vs MT5 candle open diff               |
+//| Returns the amount to SUBTRACT from TW prices to get MT5 prices  |
+//| Positive = TW higher than MT5, Negative = TW lower than MT5      |
+//|                                                                  |
+//| barTimeMs = unix epoch in milliseconds from proposal JSON         |
+//+------------------------------------------------------------------+
+double GetDivergence(string sym, double twOpen, long barTimeMs)
+  {
+   // Convert bar_time (unix ms) to MT5 datetime (unix seconds)
+   datetime barTime = (datetime)(barTimeMs / 1000);
+   
+   // barTime is the candle open time (e.g., 15m candle start)
+   // Use CopyRates to get the candle at that exact time
+   MqlRates rates[];
+   ResetLastError();
+   int copied = CopyRates(sym, PERIOD_M15, barTime, 1, rates);
+   if(copied != 1)
+     {
+      Print("[EA_Dumb] GetDivergence: CopyRates failed for ", sym, " barTime=", barTime, " copied=", copied, " err=", GetLastError());
+      return 0.0;
+     }
+   
+   double mt5Open = rates[0].open;
+   if(mt5Open <= 0)
+     {
+      Print("[EA_Dumb] GetDivergence: invalid MT5 open price (", mt5Open, ") for ", sym);
+      return 0.0;
+     }
+   
+   double divergence = twOpen - mt5Open;
+   
+   Print("[EA_Dumb] GetDivergence: ", sym, " TW_open=", twOpen, " MT5_open=", mt5Open, " diff=", divergence);
+   
+   // Sanity check: divergence should be reasonable (< 0.5% of price)
+   // If it's huge, something is wrong (wrong candle, data issue)
+   double maxDivergence = twOpen * 0.005;
+   if(MathAbs(divergence) > maxDivergence)
+     {
+      Print("[EA_Dumb] GetDivergence: divergence too large (", divergence, " > ", maxDivergence, "), ignoring");
+      return 0.0;
+     }
+   
+   return divergence;
+  }
+
+//+------------------------------------------------------------------+
+//| HasOrderForSetupId — check if any MT5 order/position has this    |
+//| setup_id in its comment. Survives EA restart since it checks     |
+//| actual trades on the terminal.                                   |
+//+------------------------------------------------------------------+
+bool HasOrderForSetupId(string setupId)
+  {
+   if(StringLen(setupId) == 0) return false;
+   
+   // Check open positions
+   int posTotal = PositionsTotal();
+   for(int i=0; i<posTotal; i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      string comment = PositionGetString(POSITION_COMMENT);
+      if(comment == setupId)
+        {
+         Print("[EA_Dumb] DUPLICATE GUARD: found position with comment=", setupId);
+         return true;
+        }
+     }
+   
+   // Check pending orders
+   int ordTotal = OrdersTotal();
+   for(int i=0; i<ordTotal; i++)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != InpMagicNumber) continue;
+      string comment = OrderGetString(ORDER_COMMENT);
+      if(comment == setupId)
+        {
+         Print("[EA_Dumb] DUPLICATE GUARD: found pending order with comment=", setupId);
+         return true;
+        }
+     }
+   
+   // Also check recent history (last 24h) as a safety net
+   datetime from = TimeGMT() - 86400;  // 24 hours back
+   datetime to   = TimeGMT() + 3600;   // 1 hour in the future
+   if(HistorySelect(from, to))
+     {
+      int total = HistoryOrdersTotal();
+      for(int i=0; i<total; i++)
+        {
+         ulong ticket = HistoryOrderGetTicket(i);
+         if(ticket == 0) continue;
+         if(HistoryOrderGetInteger(ticket, ORDER_MAGIC) != InpMagicNumber) continue;
+         string comment = HistoryOrderGetString(ticket, ORDER_COMMENT);
+         if(comment == setupId)
+           {
+            Print("[EA_Dumb] DUPLICATE GUARD: found historical order with comment=", setupId);
+            return true;
+           }
+        }
+     }
+   
+   return false;
   }
 
 //+------------------------------------------------------------------+
@@ -406,6 +556,7 @@ void PostExecute(string setupId)
    char data[], resp[];
    string resp_headers;
    StringToCharArray(body, data);
+   ArrayResize(data, ArraySize(data) - 1);  // CRITICAL: Strip null terminator from StringToCharArray
    
    // Retry up to 3 times with 1s delay
    bool success = false;
@@ -414,12 +565,14 @@ void PostExecute(string setupId)
       int res = WebRequest("POST", url, NULL, InpTimeoutMs, data, resp, resp_headers);
       if(res == 200)
         {
+         string responseText = CharArrayToString(resp);
          success = true;
-         Print("[EA_Dumb] Execute ack OK: ", setupId);
+         Print("[EA_Dumb] Execute ack OK: ", setupId, " response=", responseText);
         }
       else
         {
-         Print("[EA_Dumb] Execute ack FAILED (attempt ", retry+1, "): ", res, " for ", setupId);
+         string responseText = CharArrayToString(resp);
+         Print("[EA_Dumb] Execute ack FAILED (attempt ", retry+1, "): res=", res, " for ", setupId, " response=", responseText);
          if(retry < 2) Sleep(1000);
         }
      }
@@ -427,6 +580,7 @@ void PostExecute(string setupId)
    if(!success)
      {
       Print("[EA_Dumb] CRITICAL: Execute ack failed after 3 retries for ", setupId, " - proposal will NOT be deleted!");
+      Print("[EA_Dumb] CRITICAL: But DUPLICATE GUARD will prevent re-taking this setup");
      }
   }
 
@@ -558,6 +712,8 @@ void SessionAdd(string &arr[], int &count, string val)
   }
 //+------------------------------------------------------------------+
 
+
+
 //+------------------------------------------------------------------+
 //| ExportAccountData — writes account, positions, history to JSON    |
 //+------------------------------------------------------------------+
@@ -615,6 +771,40 @@ void ExportAccountData()
      }
    json += "],";
 
+   // Pending orders
+   json += "\"pending_orders\":[";
+   int ordTotal = OrdersTotal();
+   for(int i = 0; i < ordTotal; i++)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      string sym = OrderGetString(ORDER_SYMBOL);
+      if(sym == "") continue;
+      long type     = OrderGetInteger(ORDER_TYPE);
+      string typeStr = (type == ORDER_TYPE_BUY_LIMIT ? "buy_limit" : (type == ORDER_TYPE_SELL_LIMIT ? "sell_limit" : (type == ORDER_TYPE_BUY_STOP ? "buy_stop" : (type == ORDER_TYPE_SELL_STOP ? "sell_stop" : "unknown"))));
+      double lots   = OrderGetDouble(ORDER_VOLUME_CURRENT);
+      double price  = OrderGetDouble(ORDER_PRICE_OPEN);
+      double sl     = OrderGetDouble(ORDER_SL);
+      double tp     = OrderGetDouble(ORDER_TP);
+      datetime openAt = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
+      string comment = OrderGetString(ORDER_COMMENT);
+      long timeExp = OrderGetInteger(ORDER_TIME_EXPIRATION);
+      int dig = (StringFind(sym, "JPY") >= 0 || sym == "XAUUSD") ? 3 : 5;
+      if(i > 0) json += ",";
+      json += "{"
+              + "\"ticket\":"    + IntegerToString((long)ticket) + ","
+              + "\"symbol\":\""  + sym + "\","
+              + "\"type\":\""    + typeStr + "\","
+              + "\"lots\":"     + DoubleToString(lots, 2) + ","
+              + "\"price\":"    + DoubleToString(price, dig) + ","
+              + "\"sl\":"       + DoubleToString(sl, dig) + ","
+              + "\"tp\":"       + DoubleToString(tp, dig) + ","
+              + "\"expires_at\":"+ IntegerToString(timeExp) + ","
+              + "\"comment\":\"" + comment + "\""
+              + "}";
+     }
+   json += "],";
+
    // History (last 100 deals)
    if(HistorySelect(0, TimeCurrent()))
      {
@@ -664,6 +854,9 @@ void ExportAccountData()
       json += "\"history\":[]";
      }
 
+   // Include divergence info
+   json += ",\"divergence_enabled\":" + (InpDivergenceFix ? "true" : "false");
+
    json += "}";
 
    int handle = FileOpen(path, FILE_WRITE|FILE_TXT);
@@ -677,4 +870,3 @@ void ExportAccountData()
       Print("[EA_Dumb] ExportAccountData: failed to open ", path);
      }
   }
-

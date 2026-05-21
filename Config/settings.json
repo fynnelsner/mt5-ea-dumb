@@ -1,0 +1,101 @@
+{
+  "project": "DevyyTrades MT5 Webhook Strategy",
+  "version": "1.0.0",
+  "description": "Automated trading system using TradingView webhook signals for MT5",
+
+  "webhook_server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "auth_token": "",
+    "mt5_files_path": "C:/Users/%USERNAME%/AppData/Roaming/MetaQuotes/Terminal/Common/Files",
+    "log_file": "webhook_server.log",
+    "signal_file": "DevyyTrades_Signals.json",
+    "max_signals_per_minute": 60
+  },
+
+  "trading": {
+    "symbols": ["USDJPY", "GBPUSD", "AUDUSD", "XAUUSD"],
+    "timeframe": "M15",
+    "trading_hours": {
+      "start": "08:00",
+      "end": "22:00",
+      "timezone": "CET"
+    },
+    "asian_session_filter": {
+      "enabled": true,
+      "block_before_minutes": 120,
+      "block_after_minutes": 120
+    }
+  },
+
+  "risk_management": {
+    "max_risk_per_trade": 2.0,
+    "max_sl_pips": 50,
+    "min_sl_pips": 5,
+    "default_rr_ratio": 2.0,
+    "breakeven_after_rr": 1.0,
+    "partial_close": {
+      "enabled": false,
+      "percentage": 50,
+      "trigger_rr": 1.5
+    }
+  },
+
+  "signal_validation": {
+    "trend_confirmation": true,
+    "fvg_confirmation": true,
+    "news_filter": true,
+    "signal_expiry_seconds": 300,
+    "require_bos_choch": true,
+    "check_fvg_4h": true,
+    "check_fvg_daily": true
+  },
+
+  "order_settings": {
+    "limit_order_expiry_hours": 2,
+    "limit_order_expiry_minutes": 30,
+    "order_type": "LIMIT",
+    "slippage_points": 3,
+    "max_spread_points": 20
+  },
+
+  "indicators": {
+    "wickless": {
+      "webhook_url": "http://YOUR_IP:8080",
+      "send_nowick_alerts": true,
+      "send_bos_alerts": true,
+      "send_choch_alerts": true,
+      "include_swing_points": true
+    },
+    "fvg": {
+      "webhook_url": "http://YOUR_IP:8080",
+      "timeframes": ["4H", "DAILY"],
+      "send_4h_alerts": true,
+      "send_daily_alerts": true
+    },
+    "news": {
+      "webhook_url": "http://YOUR_IP:8080",
+      "exit_before_minutes": 15,
+      "block_before_minutes": 120,
+      "high_impact_only": true
+    }
+  },
+
+  "mt5_settings": {
+    "magic_number": 1001,
+    "expert_name": "WebhookStrategyEA",
+    "chart_timeframe": "M15",
+    "auto_trading": true,
+    "allow_live_trading": true,
+    "dll_imports": false,
+    "web_requests_allowed": true
+  },
+
+  "logging": {
+    "level": "INFO",
+    "log_signals": true,
+    "log_trades": true,
+    "log_errors": true,
+    "keep_logs_days": 7
+  }
+}

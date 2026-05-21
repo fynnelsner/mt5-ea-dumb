@@ -1,0 +1,987 @@
+//@version=6
+indicator("DevyyTrades Wickless + FVG v8", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+getPipSize(goldMode, silverMode) =>
+    bool isGold = str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "GOLD")
+    bool isSilver = str.contains(syminfo.ticker, "XAG") or str.contains(syminfo.ticker, "SILVER")
+    float goldVal = goldMode == "Standard ($0.10)" ? 0.1 : 0.01
+    float silverVal = silverMode == "Standard ($0.01)" ? 0.01 : 0.001
+    isGold ? goldVal : isSilver ? silverVal : (syminfo.mintick * (syminfo.type == "forex" or syminfo.type == "cfd" ? 10 : 1))
+
+getTextSize(sizeStr) =>
+    sizeStr == "Tiny" ? size.tiny : sizeStr == "Small" ? size.small : sizeStr == "Large" ? size.large : sizeStr == "Huge" ? size.huge : size.normal
+
+getZoneDuration(sessStr) =>
+    string zt = str.substring(sessStr, 0, 9)
+    int sH = int(str.tonumber(str.substring(zt, 0, 2)))
+    int sM = int(str.tonumber(str.substring(zt, 2, 4)))
+    int eH = int(str.tonumber(str.substring(zt, 5, 7)))
+    int eM = int(str.tonumber(str.substring(zt, 7, 9)))
+    int startMinutes = sH * 60 + sM
+    int endMinutes = eH * 60 + eM
+    if endMinutes < startMinutes
+        endMinutes += 24 * 60
+    (endMinutes - startMinutes) * 60000
+
+jsonPrice(v) =>
+    na(v) ? "null" : str.tostring(v)
+
+shouldSendWebhook(enableWebhooks) =>
+    enableWebhooks and barstate.isconfirmed
+
+htfTF(usrTF) =>
+    float chartTFin = timeframe.in_seconds() / 60
+    switch
+        usrTF == "5 Minutes" and chartTFin <= 5 => "5"
+        usrTF == "15 Minutes" and chartTFin <= 15 => "15"
+        usrTF == "1 Hour" and chartTFin <= 60 => "60"
+        usrTF == "4 Hours" and chartTFin <= 240 => "240"
+        usrTF == "1 Day" and timeframe.isintraday => "D"
+        usrTF == "1 Week" and (timeframe.isdaily or timeframe.isintraday) => "W"
+        usrTF == "1 Month" and (timeframe.isweekly or timeframe.isdaily or timeframe.isintraday) => "M"
+        => timeframe.period
+
+trimFvgArray(fvgArray, keepCount) =>
+    while fvgArray.size() > keepCount
+        old = fvgArray.pop()
+        old.lbTxt.delete()
+        old.lnTop.delete()
+        old.lnAvg.delete()
+        old.lnBtm.delete()
+
+buildFvgEntry(fvgObj, tf) =>
+    string _state = fvgObj.wasRespected ? "respected" : fvgObj.wasMitigated ? "mitigated" : "active"
+    string _mitPx = fvgObj.wasMitigated ? str.tostring(fvgObj.mitPrice) : "null"
+    '{"slot":"' + fvgObj.slotId + '","tf":"' + tf + '","direction":"' + fvgObj.direction + '","zone_top":' + str.tostring(fvgObj.zoneTop) + ',"zone_bottom":' + str.tostring(fvgObj.zoneBottom) + ',"zone_mid":' + str.tostring(math.avg(fvgObj.zoneTop,fvgObj.zoneBottom)) + ',"state":"' + _state + '","mit_price":' + _mitPx + '}'
+
+buildFvgJson(entriesArr) =>
+    int sz = array.size(entriesArr)
+    if sz == 0
+        "[]"
+    else
+        string out = "["
+        for i = 0 to sz - 1
+            if i > 0
+                out := out + ","
+            out := out + array.get(entriesArr, i)
+        out := out + "]"
+        out
+
+collectFvgEntries(fvgArray, tf, entriesArr) =>
+    int sz = array.size(fvgArray)
+    if sz > 0
+        for i = 0 to sz - 1
+            fvg = array.get(fvgArray, i)
+            if not fvg.breakConfirmed
+                array.push(entriesArr, buildFvgEntry(fvg, tf))
+
+isPriceInZone(fvg, isBull) =>
+    isBull ? (low <= fvg.zoneTop and high >= fvg.zoneBottom) : (high >= fvg.zoneBottom and low <= fvg.zoneTop)
+
+isPriceRespecting(fvg, isBull) =>
+    isBull ? (close > fvg.zoneTop) : (close < fvg.zoneBottom)
+
+updateFvg(fvgArray, fill, side, fvgLb, slotId, tf) =>
+    if fvgArray.size() > 0
+        for i = array.size(fvgArray) - 1 to 0
+            fvg = array.get(fvgArray, i)
+            if fvg.breakConfirmed
+                continue
+            bool inZone = isPriceInZone(fvg, side == "bull")
+            bool respecting = isPriceRespecting(fvg, side == "bull")
+            if inZone and not fvg.wasMitigated
+                fvg.wasMitigated := true
+                fvg.mitPrice := close
+            if fvg.wasMitigated and respecting and not fvg.wasRespected
+                fvg.wasRespected := true
+            fvg.lbTxt.set_x(bar_index + 1)
+            fvg.lnTop.set_x2(bar_index + 1)
+            fvg.lnAvg.set_x2(bar_index + 1)
+            fvg.lnBtm.set_x2(bar_index + 1)
+            if fill != "None"
+                fillRatio = switch side
+                    "bull" => (fvg.lnTop.get_y1() - low)  / (fvg.lnTop.get_y1() - fvg.lnBtm.get_y1())
+                    "bear" => (high - fvg.lnBtm.get_y1()) / (fvg.lnTop.get_y1() - fvg.lnBtm.get_y1())
+                    => 0.0
+                if fillRatio > fvg.mit
+                    fvg.mit := fillRatio
+                    fvg.lbTxt.set_text(fvgLb == "Show" ? fvg.txt + str.format("{0,number,(#.#%)}", fillRatio) : "")
+            else
+                fvg.lbTxt.set_text(fvgLb == "Show" ? fvg.txt : "")
+            array.set(fvgArray, i, fvg)
+
+cleanupBreakConfirmedFvgs(fvgArray) =>
+    if fvgArray.size() > 0
+        for i = fvgArray.size() - 1 to 0
+            fvg = array.get(fvgArray, i)
+            if fvg.breakConfirmed
+                fvgArray.remove(i)
+                fvg.lbTxt.delete()
+                fvg.lnTop.delete()
+                fvg.lnAvg.delete()
+                fvg.lnBtm.delete()
+
+// ============================================================================
+// STRUCTURE HISTORY TRACKER (last 5 BOS/ChoCh)
+// ============================================================================
+buildStructEntry(direction, breakType, breakLevel) =>
+    string _dir = direction == 1 ? "bullish" : "bearish"
+    '{"direction":"' + _dir + '","break_type":"' + breakType + '","break_level":' + jsonPrice(breakLevel) + ',"bar_time":' + str.tostring(time) + ',"bar_index":' + str.tostring(bar_index) + '}'
+
+buildStructHistoryJson(histArr) =>
+    int sz = array.size(histArr)
+    if sz == 0
+        "[]"
+    else
+        string out = "["
+        for i = 0 to sz - 1
+            if i > 0
+                out := out + ","
+            out := out + array.get(histArr, i)
+        out := out + "]"
+        out
+
+// ============================================================================
+// TYPES
+// ============================================================================
+type HTFBar
+    float price = na
+    int   index = na
+
+type HTFBarOHLC
+    HTFBar open
+    HTFBar high
+    HTFBar low
+    HTFBar close
+
+type FVG
+    label  lbTxt
+    line   lnTop
+    line   lnAvg
+    line   lnBtm
+    float  mitPrice
+    float  mit
+    string txt
+    float  zoneTop
+    float  zoneBottom
+    string direction
+    string slotId
+    int    consecutiveBeyond
+    float  maxDistanceBeyond
+    bool   breakConfirmed
+    int    createdBarIndex
+    bool   wasMitigated
+    bool   wasRespected
+    float  lastCloseBeforeMitigation
+
+// ============================================================================
+// INPUTS  WICKLESS
+// ============================================================================
+grpRiskMain  = "Risk Dashboard: Main Settings"
+showRiskDash = input.bool(true, title="Risk Dashboard", group=grpRiskMain)
+accountCurr  = input.string("USD", title="Account Currency", options=["USD", "EUR", "GBP", "AUD", "CAD", "CHF", "JPY", "NZD"], tooltip="Select your account currency to auto-calculate exact real-time lot sizes.", group=grpRiskMain)
+slPips       = input.float(30.6, title="Stop Loss (Pips)", group=grpRiskMain)
+
+grpRiskPct   = "Risk Dashboard: Account Balance & Risk"
+accountBal   = input.float(100000, title="Account Balance", group=grpRiskPct)
+riskPercent  = input.float(2.0, title="Percentage Risk (%)", step=0.01, group=grpRiskPct)
+
+grpRiskMetals = "Risk Dashboard: Gold & Silver Settings"
+goldPipMode  = input.string("Standard ($0.10)", title="Gold Pip Size", options=["Standard ($0.10)", "Micro ($0.01)"], tooltip="Adjust this if your broker calculates Gold pips differently.", group=grpRiskMetals)
+silverPipMode = input.string("Standard ($0.01)", title="Silver Pip Size", options=["Standard ($0.01)", "Micro ($0.001)"], tooltip="Adjust this if your broker calculates Silver pips differently.", group=grpRiskMetals)
+
+grpBacktest  = "Win Rate Dashboard"
+showBacktest = input.bool(false, title="Win Rate Dashboard", group=grpBacktest)
+btWins       = input.int(0, title="Total Wins", minval=0, group=grpBacktest)
+btLosses     = input.int(0, title="Total Losses", minval=0, group=grpBacktest)
+
+grpExt = "External Market Structure Settings"
+pivotLength          = input.int(5, title="EMS Pivot Length", minval=1, tooltip="WARNING: Don't change this unless you know exactly what it means!", group=grpExt)
+showStruct           = input.bool(true, title="Show HH/HL/LH/LL", group=grpExt)
+anchorType           = input.string("Body", title="Draw Lines From", options=["Body", "Wick"], group=grpExt)
+showBosChoch         = input.bool(true, title="Show CHoCH/BOS", group=grpExt)
+
+grpStructColors = "Structure Colors"
+colorBullBreak       = input.color(color.green, title="Bullish Breakouts (BOS/CHoCH)", group=grpStructColors)
+colorBearBreak       = input.color(color.red,   title="Bearish Breakouts (BOS/CHoCH)", group=grpStructColors)
+colorHH_HL           = input.color(color.green, title="Bullish Structure (HH/HL)", group=grpStructColors)
+colorLH_LL           = input.color(color.red,   title="Bearish Structure (LH/LL)", group=grpStructColors)
+
+grpSessText = "Global Session Label Settings"
+sessTextColor   = input.color(color.new(#912424, 57), title="Session Text Color", group=grpSessText)
+sessTextSizeStr = input.string("Normal", title="Session Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpSessText)
+zoneTz          = input.string("America/New_York", title="Timezone", tooltip="Master clock for all sessions. Leave as America/New_York to ensure zone times draw accurately regardless of your local timezone.", group=grpSessText)
+
+grpZone = "Session Break Zone"
+showZone        = input.bool(true, title="Enable Session Break Background", group=grpZone)
+showZoneText    = input.bool(true, title="Show No Trading Zone Text", group=grpZone)
+zoneTime        = input.session("1500-1900", title="Zone Hours (HHMM-HHMM)", group=grpZone)
+zoneColor       = input.color(color.new(#912424, 82), title="Zone Background Color", group=grpZone)
+
+grpAsia = "Asia Session"
+showAsia      = input.bool(false, title="Enable Asia Background", group=grpAsia)
+showAsiaText  = input.bool(false, title="Show ASIA Text", group=grpAsia)
+asiaTime      = input.session("1800-0200", title="Asia Hours", group=grpAsia)
+asiaColor     = input.color(color.new(color.blue, 85), title="Asia Color", group=grpAsia)
+
+grpLon = "London Session"
+showLon       = input.bool(false, title="Enable London Background", group=grpLon)
+showLonText   = input.bool(false, title="Show LONDON Text", group=grpLon)
+lonTime       = input.session("0300-0900", title="London Hours", group=grpLon)
+lonColor      = input.color(color.new(color.gray, 85), title="London Color", group=grpLon)
+
+grpNY = "New York Session"
+showNY        = input.bool(false, title="Enable New York Background", group=grpNY)
+showNYText    = input.bool(false, title="Show NEW YORK Text", group=grpNY)
+nyTime        = input.session("0800-1700", title="New York Hours", group=grpNY)
+nyColor       = input.color(color.new(color.green, 85), title="New York Color", group=grpNY)
+
+grpArr = "No-Wick Open Triangles"
+showNoWick      = input.bool(true, title="Show No-Wick Triangles", group=grpArr)
+arrowSizeStr    = input.string("Small", title="Triangle Size", options=["Small", "Normal"], group=grpArr)
+bullArrowColor  = input.color(color.green, title="Bullish Color", group=grpArr)
+bearArrowColor  = input.color(color.red, title="Bearish Color", group=grpArr)
+
+// ============================================================================
+// INPUTS  FVG
+// ============================================================================
+fvgGR     = "Fair Value Gaps (4H + Daily)"
+fvgSH1    = input.bool(true, "Enable 4H FVGs", group = fvgGR)
+fvgFill1  = input.string("Wick Sweep", "Fill Method", options = ["None", "Any Touch", "Midpoint Reached", "Wick Sweep", "Body Beyond"], group = fvgGR)
+fvgCb1    = input.color(#00B8D9, "Bull Color", group = fvgGR)
+fvgCs1    = input.color(#FF8B00, "Bear Color", group = fvgGR)
+nfvgLB1   = input.string("Show", "Labels", options = ["Show", "Hide"], group = fvgGR)
+maxBars1  = input.int(360, "Max Bars Back", minval = 1, step = 20, group = fvgGR)
+
+fvgSH2    = input.bool(false, "Enable Daily FVGs", group = fvgGR)
+fvgFill2  = input.string("Wick Sweep", "Fill Method", options = ["None", "Any Touch", "Midpoint Reached", "Wick Sweep", "Body Beyond"], group = fvgGR)
+fvgCb2    = input.color(#6EE7B7, "Bull Color", group = fvgGR)
+fvgCs2    = input.color(#FF6B6B, "Bear Color", group = fvgGR)
+nfvgLB2   = input.string("Hide", "Labels", options = ["Show", "Hide"], group = fvgGR)
+maxBars2  = input.int(360, "Max Bars Back", minval = 1, step = 20, group = fvgGR)
+
+maxFvgKeep = input.int(5, "Max Active FVGs per direction", minval=1, maxval=20, group=fvgGR)
+minFvgPips = input.float(10.0, "Minimum FVG Size (pips)", minval=1.0, step=1.0, tooltip="FVGs smaller than this are ignored. Increase to filter noise.", group=fvgGR)
+invalidateOnStructBreak = input.bool(true, "Invalidate FVGs on 15m BOS/ChoCh", group=fvgGR)
+
+// ============================================================================
+// INPUTS  WEBHOOK
+// ============================================================================
+grpWebhook = "Webhook Settings"
+enableWebhooks = input.bool(false, title="Enable Webhooks", group=grpWebhook)
+sendWicklessEvents = input.bool(true, title="Send Wickless Candle Events", group=grpWebhook)
+enableReplayBridge = input.bool(false, title="Enable Replay Mode Bridge", tooltip="Enable ONLY during TradingView Replay. Keep Enable Webhooks ON — TradingView suppresses real webhooks in replay, but the script needs them enabled so Tampermonkey can intercept alert text and POST to /backtest.", group=grpWebhook)
+
+// ============================================================================
+// WEBHOOK BUILDER (No-Wick ONLY with FVGs + structure history + trend)
+// ============================================================================
+// CLEAN: No-Wick ONLY — no FVGs or structure baked in
+buildWicklessWebhook(direction, entryAnchor, latestHigh, latestLow, trendDirection) =>
+    '{"source":"wickless","event":"wickless_signal","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","bar_time":' + str.tostring(time) + ',"data":{"direction":"' + direction + '","trend_direction":"' + trendDirection + '","entry_anchor":' + jsonPrice(entryAnchor) + ',"candle_open":' + jsonPrice(open) + ',"candle_high":' + jsonPrice(high) + ',"candle_low":' + jsonPrice(low) + ',"candle_close":' + jsonPrice(close) + ',"latest_structure_high":' + jsonPrice(latestHigh) + ',"latest_structure_low":' + jsonPrice(latestLow) + '}}'
+
+buildReplayBridgeWrapper(payloadJson) =>
+    '{"replay_bridge":true,"payload":' + payloadJson + '}'
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+bool isGoldChart   = str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "GOLD")
+bool isSilverChart = str.contains(syminfo.ticker, "XAG") or str.contains(syminfo.ticker, "SILVER")
+int pipOffset      = isGoldChart ? 1000 : isSilverChart ? 400 : 50
+string activeZoneTime = (isGoldChart or isSilverChart) and zoneTime == "1500-1900" ? "1500-2000" : zoneTime
+
+// Consecutive BOS/ChoCh tracking for FVG invalidation (2-break rule)
+var int g_lastBullBreakBar = na
+var int g_lastBearBreakBar = na
+
+// FVG global arrays
+noColor = #00000000
+var array<FVG> bullFvgArray1 = array.new<FVG>()
+var array<FVG> bearFvgArray1 = array.new<FVG>()
+var array<HTFBarOHLC> barArray1 = array.new<HTFBarOHLC>()
+var HTFBar barOpen1 = HTFBar.new(open, bar_index)
+var HTFBar barHigh1 = HTFBar.new(high, bar_index)
+var HTFBar barLow1 = HTFBar.new(low, bar_index)
+var HTFBar barClose1 = HTFBar.new(close, bar_index)
+var HTFBarOHLC barHist1 = HTFBarOHLC.new(barOpen1, barHigh1, barLow1, barClose1)
+var int bullBarIndexEnd1 = na
+var int bullBarIndexEnd1_1 = na
+var int bearBarIndexEnd1 = na
+var int bearBarIndexEnd1_1 = na
+var bool bullProcess1 = false
+var bool bullCondition1 = false
+var bool bearProcess1 = false
+var bool bearCondition1 = false
+
+var array<FVG> bullFvgArray2 = array.new<FVG>()
+var array<FVG> bearFvgArray2 = array.new<FVG>()
+var array<HTFBarOHLC> barArray2 = array.new<HTFBarOHLC>()
+var HTFBar barOpen2 = HTFBar.new(open, bar_index)
+var HTFBar barHigh2 = HTFBar.new(high, bar_index)
+var HTFBar barLow2 = HTFBar.new(low, bar_index)
+var HTFBar barClose2 = HTFBar.new(close, bar_index)
+var HTFBarOHLC barHist2 = HTFBarOHLC.new(barOpen2, barHigh2, barLow2, barClose2)
+var int bullBarIndexEnd2 = na
+var int bullBarIndexEnd2_1 = na
+var int bearBarIndexEnd2 = na
+var int bearBarIndexEnd2_1 = na
+var bool bullProcess2 = false
+var bool bullCondition2 = false
+var bool bearProcess2 = false
+var bool bearCondition2 = false
+
+// Structure history (last 5 BOS/ChoCh)
+var array<string> structHistory = array.new<string>()
+MAX_STRUCT_HISTORY = 5
+
+// FVG entry collector
+var array<string> fvgEntries = array.new<string>()
+var array<string> invalidatedFvgJsons = array.new<string>()
+
+buildInvalidatedFvgEntry(fvgObj, tf, invalidatedBy) =>
+    string _mitPx = fvgObj.wasMitigated ? str.tostring(fvgObj.mitPrice) : "null"
+    '{"slot":"' + fvgObj.slotId + '","tf":"' + tf + '","direction":"' + fvgObj.direction + '","zone_top":' + str.tostring(fvgObj.zoneTop) + ',"zone_bottom":' + str.tostring(fvgObj.zoneBottom) + ',"zone_mid":' + str.tostring(math.avg(fvgObj.zoneTop,fvgObj.zoneBottom)) + ',"state":"invalidated","invalidated_by":"' + invalidatedBy + '","mit_price":' + _mitPx + '}'
+
+// STRUCTURE-BASED INVALIDATION — Bullish FVGs die when 15m close pushes below zone_bottom
+// Bearish FVGs die when 15m close pushes above zone_top
+// NEW: 2 consecutive BOS/ChoCh required, OR 50 pip deep penetration
+invalidateFvgsOnBreak(fvgArray, isBullFvg, tfLabel, breakType) =>
+    if invalidateOnStructBreak and fvgArray.size() > 0
+        for i = fvgArray.size() - 1 to 0
+            fvg = array.get(fvgArray, i)
+            if not fvg.breakConfirmed
+                bool broken = isBullFvg ? close < fvg.zoneBottom : close > fvg.zoneTop
+                if broken
+                    array.push(invalidatedFvgJsons, buildInvalidatedFvgEntry(fvg, tfLabel, breakType))
+                    if array.size(invalidatedFvgJsons) > 100
+                        array.shift(invalidatedFvgJsons)
+                    fvg.breakConfirmed := true
+
+// Deep penetration + consecutive bar invalidation
+// 50 pips through zone edge = dead FVG regardless of structure
+// 2 consecutive bars beyond zone (proxy for 2 BOS) = dead FVG
+checkDeepPenetration(fvgArray, isBullFvg, tfLabel) =>
+    if fvgArray.size() > 0
+        for i = fvgArray.size() - 1 to 0
+            fvg = array.get(fvgArray, i)
+            if fvg.breakConfirmed
+                continue
+            float distBeyond = isBullFvg ? fvg.zoneBottom - close : close - fvg.zoneTop
+            if distBeyond > 0
+                fvg.consecutiveBeyond := fvg.consecutiveBeyond + 1
+                fvg.maxDistanceBeyond := math.max(fvg.maxDistanceBeyond, distBeyond)
+                float pipSize = getPipSize(goldPipMode, silverPipMode)
+                float distPips = distBeyond / pipSize
+                // 50 pip deep penetration rule
+                if distPips >= 50.0
+                    array.push(invalidatedFvgJsons, buildInvalidatedFvgEntry(fvg, tfLabel, "deep_penetration_50pips"))
+                    if array.size(invalidatedFvgJsons) > 100
+                        array.shift(invalidatedFvgJsons)
+                    fvg.breakConfirmed := true
+                // 2 consecutive bars beyond zone (structural confirmation proxy)
+                else if fvg.consecutiveBeyond >= 2
+                    array.push(invalidatedFvgJsons, buildInvalidatedFvgEntry(fvg, tfLabel, "consecutive_bars_beyond"))
+                    if array.size(invalidatedFvgJsons) > 100
+                        array.shift(invalidatedFvgJsons)
+                    fvg.breakConfirmed := true
+            else
+                // Price back inside zone — reset consecutive counter
+                fvg.consecutiveBeyond := 0
+            array.set(fvgArray, i, fvg)
+
+
+// ============================================================================
+// SESSION BACKGROUNDS
+// ============================================================================
+inZone = time(timeframe.period, activeZoneTime, zoneTz)
+bgcolor(showZone and not na(inZone) ? zoneColor : na)
+var float zHigh = 0.0, var int zMid = na, var label zLbl = na
+if not na(inZone) and na(inZone[1])
+    zHigh := high, zMid := time + math.round(getZoneDuration(activeZoneTime) / 2)
+    if showZoneText
+        zLbl := label.new(zMid, high, "NO TRADING ZONE", xloc=xloc.bar_time, color=color.new(color.white, 100), textcolor=sessTextColor, style=label.style_none, size=getTextSize(sessTextSizeStr), textalign=text.align_center)
+if not na(inZone)
+    zHigh := math.max(zHigh, high)
+    if showZoneText and not na(zLbl)
+        label.set_xy(zLbl, zMid, zHigh + (getPipSize(goldPipMode, silverPipMode) * pipOffset))
+
+inAsia = time(timeframe.period, "1800-0200", zoneTz)
+bgcolor(showAsia and not na(inAsia) ? color.new(color.blue, 85) : na)
+inLon = time(timeframe.period, "0300-0900", zoneTz)
+bgcolor(showLon and not na(inLon) ? color.new(color.gray, 85) : na)
+inNY = time(timeframe.period, "0800-1700", zoneTz)
+bgcolor(showNY and not na(inNY) ? color.new(color.green, 85) : na)
+
+var line fStartLine = line.new(na, na, na, na, xloc=xloc.bar_time, extend=extend.both, width=2)
+var line fEndLine   = line.new(na, na, na, na, xloc=xloc.bar_time, extend=extend.both, width=2)
+var label fZoneLbl  = label.new(na, na, "NO TRADING ZONE", xloc=xloc.bar_time, textcolor=sessTextColor, style=label.style_none, size=getTextSize(sessTextSizeStr), textalign=text.align_center)
+var float _recentHigh = 0.0
+_recentHigh := ta.highest(high, 20)
+
+if barstate.islast and showZone
+    color solidZoneColor = color.rgb(color.r(zoneColor), color.g(zoneColor), color.b(zoneColor), 15)
+    string zt = str.substring(activeZoneTime, 0, 9)
+    int sH = int(str.tonumber(str.substring(zt, 0, 2)))
+    int sM = int(str.tonumber(str.substring(zt, 2, 4)))
+    int eH = int(str.tonumber(str.substring(zt, 5, 7)))
+    int eM = int(str.tonumber(str.substring(zt, 7, 9)))
+    int tYear = year(time, zoneTz)
+    int tMonth = month(time, zoneTz)
+    int tDay = dayofmonth(time, zoneTz)
+    int nextStart = timestamp(zoneTz, tYear, tMonth, tDay, sH, sM, 0)
+    int nextEnd   = timestamp(zoneTz, tYear, tMonth, tDay, eH, eM, 0)
+    if eH < sH
+        nextEnd += 86400000
+    if time >= nextEnd
+        nextStart += 86400000
+        nextEnd   += 86400000
+    if dayofweek(nextStart, zoneTz) == 7
+        nextStart += 86400000
+        nextEnd += 86400000
+    line.set_xy1(fStartLine, nextStart, close)
+    line.set_xy2(fStartLine, nextStart, close + syminfo.mintick)
+    line.set_color(fStartLine, solidZoneColor)
+    line.set_xy1(fEndLine, nextEnd, close)
+    line.set_xy2(fEndLine, nextEnd, close + syminfo.mintick)
+    line.set_color(fEndLine, solidZoneColor)
+    if showZoneText and na(inZone)
+        int midTime = nextStart + math.round((nextEnd - nextStart) / 2)
+        label.set_xy(fZoneLbl, midTime, _recentHigh + (getPipSize(goldPipMode, silverPipMode) * pipOffset))
+        label.set_text(fZoneLbl, "NO TRADING ZONE")
+    else
+        label.set_text(fZoneLbl, "")
+else if not showZone
+    line.set_xy1(fStartLine, na, na)
+    line.set_xy1(fEndLine, na, na)
+    label.set_xy(fZoneLbl, na, na)
+
+// ============================================================================
+// EMS STRUCTURE LOGIC (draws on chart, NO WEBHOOKS here)
+// ============================================================================
+ph = ta.pivothigh(high, pivotLength, pivotLength)
+pl = ta.pivotlow(low, pivotLength, pivotLength)
+
+var int trend = 0
+var float lastHigh = na, var float lastLow = na
+var float activeTop = na, var int activeTopLoc = na
+var float activeBtm = na, var int activeBtmLoc = na
+var bool topBroken = true, var bool btmBroken = true
+
+if not na(ph)
+    is_hh = na(lastHigh) or ph > lastHigh
+    if showStruct
+        label.new(bar_index[pivotLength], ph, is_hh ? "HH" : "LH", color=color.new(color.white, 100), textcolor=is_hh ? colorHH_HL : colorLH_LL, style=label.style_label_down, size=size.small)
+    lastHigh := ph
+    float anchorPrice = anchorType == "Body" ? math.max(open[pivotLength], close[pivotLength]) : high[pivotLength]
+    int anchorLoc = bar_index[pivotLength]
+    if anchorType == "Body"
+        for i = 0 to (pivotLength * 2)
+            float checkBody = math.max(open[i], close[i])
+            if checkBody > anchorPrice
+                anchorPrice := checkBody
+    activeTop := anchorPrice
+    activeTopLoc := anchorLoc
+    topBroken := false
+
+if not na(pl)
+    is_hl = na(lastLow) or pl > lastLow
+    if showStruct
+        label.new(bar_index[pivotLength], pl, is_hl ? "HL" : "LL", color=color.new(color.white, 100), textcolor=is_hl ? colorHH_HL : colorLH_LL, style=label.style_label_up, size=size.small)
+    lastLow := pl
+    float anchorPrice = anchorType == "Body" ? math.min(open[pivotLength], close[pivotLength]) : low[pivotLength]
+    int anchorLoc = bar_index[pivotLength]
+    if anchorType == "Body"
+        for i = 0 to (pivotLength * 2)
+            float checkBody = math.min(open[i], close[i])
+            if checkBody < anchorPrice
+                anchorPrice := checkBody
+    activeBtm := anchorPrice
+    activeBtmLoc := anchorLoc
+    btmBroken := false
+
+// ============================================================================
+// STRUCTURE BREAKS  with FVG invalidation and history tracking
+// NO WEBHOOKS sent here — BOS/ChoCh are only recorded for No-Wick payload
+// ============================================================================
+if not na(activeTop) and close > activeTop and not topBroken
+    is_bos = trend == 1
+    if showBosChoch
+        line.new(activeTopLoc, activeTop, bar_index, activeTop, color=colorBullBreak, style=line.style_solid, width=1)
+        label.new(int((activeTopLoc + bar_index) / 2), activeTop, is_bos ? "BOS" : "CHoCH", color=color.new(color.white, 100), textcolor=colorBullBreak, style=label.style_label_down, size=size.small)
+    trend := 1
+    topBroken := true
+    // Record in structure history (for No-Wick payload)
+    array.unshift(structHistory, buildStructEntry(1, is_bos ? "BOS" : "CHOCH", activeTop))
+    if array.size(structHistory) > MAX_STRUCT_HISTORY
+        array.pop(structHistory)
+    // Invalidate bearish FVGs: bullish break pushes close above bearish FVG zone_top (ONLY on 15min)
+    // NEW: require 2 consecutive breaks OR 50 pip penetration (handled in checkDeepPenetration)
+    if invalidateOnStructBreak and timeframe.period == "15"
+        bool isConsecutive = (not na(g_lastBullBreakBar) and bar_index == g_lastBullBreakBar + 1)
+        if isConsecutive
+            string breakType = is_bos ? "bullish_BOS_consecutive" : "bullish_ChoCH_consecutive"
+            invalidateFvgsOnBreak(bearFvgArray1, false, "HTF1", breakType)
+            invalidateFvgsOnBreak(bearFvgArray2, false, "HTF2", breakType)
+        g_lastBullBreakBar := bar_index
+        g_lastBearBreakBar := na
+
+if not na(activeBtm) and close < activeBtm and not btmBroken
+    is_bos = trend == -1
+    if showBosChoch
+        line.new(activeBtmLoc, activeBtm, bar_index, activeBtm, color=colorBearBreak, style=line.style_solid, width=1)
+        label.new(int((activeBtmLoc + bar_index) / 2), activeBtm, is_bos ? "BOS" : "CHoCH", color=color.new(color.white, 100), textcolor=colorBearBreak, style=label.style_label_up, size=size.small)
+    trend := -1
+    btmBroken := true
+    // Record in structure history (for No-Wick payload)
+    array.unshift(structHistory, buildStructEntry(-1, is_bos ? "BOS" : "CHOCH", activeBtm))
+    if array.size(structHistory) > MAX_STRUCT_HISTORY
+        array.pop(structHistory)
+    // Invalidate bullish FVGs: bearish break pushes close below bullish FVG zone_bottom (ONLY on 15min)
+    // NEW: require 2 consecutive breaks OR 50 pip penetration (handled in checkDeepPenetration)
+    if invalidateOnStructBreak and timeframe.period == "15"
+        bool isConsecutive = (not na(g_lastBearBreakBar) and bar_index == g_lastBearBreakBar + 1)
+        if isConsecutive
+            string breakType = is_bos ? "bearish_BOS_consecutive" : "bearish_ChoCH_consecutive"
+            invalidateFvgsOnBreak(bullFvgArray1, true, "HTF1", breakType)
+            invalidateFvgsOnBreak(bullFvgArray2, true, "HTF2", breakType)
+        g_lastBearBreakBar := bar_index
+        g_lastBullBreakBar := na
+
+// ============================================================================
+// FVG DETECTION  SLOT 1 (4H)
+// ============================================================================
+string tf1 = htfTF("4 Hours")
+bool fvgTf1 = tf1 == timeframe.period
+if timeframe.change(tf1)
+    bullProcess1 := false
+    bearProcess1 := false
+    if barArray1.size() > 2
+        barArray1.pop()
+    barArray1.unshift(barHist1)
+    // --- Weekend / session gap detection (HTF1) ---
+    float prevClose1 = barClose1.price
+    float gapSize1 = math.abs(open - prevClose1)
+    if gapSize1 > syminfo.mintick * 20
+        if open > prevClose1
+            float gTop1 = open
+            float gBtm1 = prevClose1
+            fvgG1 = FVG.new(
+                label.new(bar_index + 1, math.avg(gTop1, gBtm1), nfvgLB1 == "Show" ? (fvgTf1 ? "Chart(" + tf1 + ") GAP" : "HTF(" + tf1 + ") GAP") : "", xloc.bar_index, color=noColor, style=label.style_label_left, textcolor=fvgCb1, size=size.small,
+                 tooltip=(fvgTf1 ? "Chart(" + tf1 + ") Bullish Gap" : "HTF(" + tf1 + ") Bullish Gap") + "\n\nZone Top " + str.format("{0, number, #,###.##}", gTop1) + "\nZone Mid " + str.format("{0, number, #,###.##}", math.avg(gTop1, gBtm1)) + "\nZone Btm " + str.format("{0, number, #,###.##}", gBtm1)),
+                line.new(bar_index, gTop1, bar_index + 1, gTop1, color=color.new(fvgCb1, 65)),
+                line.new(bar_index, math.avg(gTop1, gBtm1), bar_index + 1, math.avg(gTop1, gBtm1), style=line.style_dotted, color=color.new(fvgCb1, 25)),
+                line.new(bar_index, gBtm1, bar_index + 1, gBtm1, color=color.new(fvgCb1, 50), width=2),
+                fvgFill1 == "Midpoint Reached" ? math.avg(gTop1, gBtm1) : fvgFill1 == "Any Touch" ? gTop1 : gBtm1,
+                0,
+                fvgTf1 ? "Chart(" + tf1 + ") GAP" : "HTF(" + tf1 + ") GAP",
+                gTop1, gBtm1, "bullish", "HTF1", 0, 0.0, false, bar_index,
+                false, false, na
+             )
+            bullFvgArray1.unshift(fvgG1)
+            firstG1 = bullFvgArray1.first()
+            linefill.new(firstG1.lnTop, firstG1.lnBtm, color.new(fvgCb1, 89))
+            trimFvgArray(bullFvgArray1, maxFvgKeep)
+        else
+            float gTop1b = prevClose1
+            float gBtm1b = open
+            fvgG1b = FVG.new(
+                label.new(bar_index + 1, math.avg(gTop1b, gBtm1b), nfvgLB1 == "Show" ? (fvgTf1 ? "Chart(" + tf1 + ") GAP" : "HTF(" + tf1 + ") GAP") : "", xloc.bar_index, color=noColor, style=label.style_label_left, textcolor=fvgCs1, size=size.small,
+                 tooltip=(fvgTf1 ? "Chart(" + tf1 + ") Bearish Gap" : "HTF(" + tf1 + ") Bearish Gap") + "\n\nZone Top " + str.format("{0, number, #,###.##}", gTop1b) + "\nZone Mid " + str.format("{0, number, #,###.##}", math.avg(gTop1b, gBtm1b)) + "\nZone Btm " + str.format("{0, number, #,###.##}", gBtm1b)),
+                line.new(bar_index, gTop1b, bar_index + 1, gTop1b, color=color.new(fvgCs1, 50), width=2),
+                line.new(bar_index, math.avg(gTop1b, gBtm1b), bar_index + 1, math.avg(gTop1b, gBtm1b), style=line.style_dotted, color=color.new(fvgCs1, 25)),
+                line.new(bar_index, gBtm1b, bar_index + 1, gBtm1b, color=color.new(fvgCs1, 65)),
+                fvgFill1 == "Midpoint Reached" ? math.avg(gTop1b, gBtm1b) : fvgFill1 == "Any Touch" ? gBtm1b : gTop1b,
+                0,
+                fvgTf1 ? "Chart(" + tf1 + ") GAP" : "HTF(" + tf1 + ") GAP",
+                gTop1b, gBtm1b, "bearish", "HTF1", 0, 0.0, false, bar_index,
+                false, false, na
+             )
+            bearFvgArray1.unshift(fvgG1b)
+            firstG1b = bearFvgArray1.first()
+            linefill.new(firstG1b.lnTop, firstG1b.lnBtm, color.new(fvgCs1, 89))
+            trimFvgArray(bearFvgArray1, maxFvgKeep)
+    barOpen1  := HTFBar.new(open, bar_index)
+    barHigh1  := HTFBar.new(high, bar_index)
+    barLow1   := HTFBar.new(low, bar_index)
+    barClose1 := HTFBar.new(close, bar_index)
+    barHist1  := HTFBarOHLC.new(barOpen1, barHigh1, barLow1, barClose1)
+    bullBarIndexEnd1_1 := bullBarIndexEnd1
+    bullBarIndexEnd1  := bar_index
+    bearBarIndexEnd1_1 := bearBarIndexEnd1
+    bearBarIndexEnd1  := bar_index
+else
+    if high > barHigh1.price
+        barHigh1.price := high
+        barHigh1.index := bar_index
+    if low < barLow1.price
+        barLow1.price := low
+        barLow1.index := bar_index
+    barClose1.price := close
+    barClose1.index := bar_index
+    barHist1 := HTFBarOHLC.new(barOpen1, barHigh1, barLow1, barClose1)
+    if barArray1.size() > 2
+        if low < barArray1.get(1).high.price
+            bullBarIndexEnd1 := bar_index
+        if high > barArray1.get(1).low.price
+            bearBarIndexEnd1 := bar_index
+
+if barArray1.size() > 2
+    float minGap1 = syminfo.mintick * minFvgPips * 10
+    // Bullish FVG: candle 2 low > candle 1 high, candle 3 low > candle 1 high. Zone = candle1.high → candle3.low.
+    bool bullGap1 = barArray1.get(1).low.price > barArray1.get(2).high.price and barArray1.get(0).low.price > barArray1.get(2).high.price
+    bool bullZoneOk1 = barArray1.get(0).low.price > barArray1.get(2).high.price
+    bullCondition1 := bullGap1 and bullZoneOk1 and (barArray1.get(1).low.price - barArray1.get(2).high.price) >= minGap1
+    // Bearish FVG: candle 2 high < candle 1 low, candle 3 high < candle 1 low. Zone = candle3.high → candle1.low.
+    bool bearGap1 = barArray1.get(1).high.price < barArray1.get(2).low.price and barArray1.get(0).high.price < barArray1.get(2).low.price
+    bool bearZoneOk1 = barArray1.get(0).high.price < barArray1.get(2).low.price
+    bearCondition1 := bearGap1 and bearZoneOk1 and (barArray1.get(2).low.price - barArray1.get(1).high.price) >= minGap1
+
+if bullCondition1 and not bullProcess1
+    bullProcess1 := true
+    // DEBUG: show why this FVG was created
+    label.new(bar_index, high + syminfo.mintick * 100, "BULL FVG DEBUG\nC3 low=" + str.tostring(barArray1.get(0).low.price, "#.#####") + "\nC2 low=" + str.tostring(barArray1.get(1).low.price, "#.#####") + "\nC1 high=" + str.tostring(barArray1.get(2).high.price, "#.#####") + "\nGap=" + str.tostring(barArray1.get(1).low.price - barArray1.get(2).high.price, "#.#####"), color=color.white, textcolor=color.black, style=label.style_label_down, size=size.small)
+    float zoneTop01 = barArray1.get(0).low.price
+    float zoneBtm01 = barArray1.get(2).high.price
+    fvg01 = FVG.new(
+        label.new(bar_index + 1, math.avg(zoneTop01, zoneBtm01), nfvgLB1 == "Show" ? (fvgTf1 ? "Chart(" + tf1 + ") FVG" : "HTF(" + tf1 + ") FVG") : "", xloc.bar_index, color=noColor, style=label.style_label_left, textcolor=fvgCb1, size=size.small,
+         tooltip=(fvgTf1 ? "Chart(" + tf1 + ") Bullish FVG" : "HTF(" + tf1 + ") Bullish FVG") + "\n\nZone Top " + str.format("{0, number, #,###.##}", zoneTop01) + "\nZone Mid " + str.format("{0, number, #,###.##}", math.avg(zoneTop01, zoneBtm01)) + "\nZone Btm " + str.format("{0, number, #,###.##}", zoneBtm01)),
+        line.new(barArray1.get(0).low.index, zoneTop01, bar_index + 1, zoneTop01, color=color.new(fvgCb1, 65)),
+        line.new(math.ceil(math.avg(barArray1.get(0).low.index, barArray1.get(2).high.index)), math.avg(zoneTop01, zoneBtm01), bar_index + 1, math.avg(zoneTop01, zoneBtm01), style=line.style_dotted, color=color.new(fvgCb1, 25)),
+        line.new(barArray1.get(2).high.index, zoneBtm01, bar_index + 1, zoneBtm01, color=color.new(fvgCb1, 50), width=2),
+        fvgFill1 == "Midpoint Reached" ? math.avg(zoneTop01, zoneBtm01) : fvgFill1 == "Any Touch" ? zoneTop01 : zoneBtm01,
+        0,
+        fvgTf1 ? "Chart(" + tf1 + ") FVG" : "HTF(" + tf1 + ") FVG",
+        zoneTop01, zoneBtm01, "bullish", "HTF1", 0, 0.0, false, bar_index,
+        false, false, na
+     )
+    bullFvgArray1.unshift(fvg01)
+    first1 = bullFvgArray1.first()
+    linefill.new(first1.lnTop, first1.lnBtm, color.new(fvgCb1, 89))
+    trimFvgArray(bullFvgArray1, maxFvgKeep)
+
+if bearCondition1 and not bearProcess1
+    bearProcess1 := true
+    // DEBUG: show why this FVG was created
+    label.new(bar_index, low - syminfo.mintick * 100, "BEAR FVG DEBUG\nC3 high=" + str.tostring(barArray1.get(0).high.price, "#.#####") + "\nC2 high=" + str.tostring(barArray1.get(1).high.price, "#.#####") + "\nC1 low=" + str.tostring(barArray1.get(2).low.price, "#.#####") + "\nGap=" + str.tostring(barArray1.get(2).low.price - barArray1.get(1).high.price, "#.#####"), color=color.white, textcolor=color.black, style=label.style_label_up, size=size.small)
+    float zoneTop02 = barArray1.get(2).low.price
+    float zoneBtm02 = barArray1.get(0).high.price
+    fvg02 = FVG.new(
+        label.new(bar_index + 1, math.avg(zoneTop02, zoneBtm02), nfvgLB1 == "Show" ? (fvgTf1 ? "Chart(" + tf1 + ") FVG" : "HTF(" + tf1 + ") FVG") : "", xloc.bar_index, color=noColor, style=label.style_label_left, textcolor=fvgCs1, size=size.small,
+         tooltip=(fvgTf1 ? "Chart(" + tf1 + ") Bearish FVG" : "HTF(" + tf1 + ") Bearish FVG") + "\n\nZone Top " + str.format("{0, number, #,###.##}", zoneTop02) + "\nZone Mid " + str.format("{0, number, #,###.##}", math.avg(zoneTop02, zoneBtm02)) + "\nZone Btm " + str.format("{0, number, #,###.##}", zoneBtm02)),
+        line.new(barArray1.get(2).low.index, zoneTop02, bar_index + 1, zoneTop02, color=color.new(fvgCs1, 50), width=2),
+        line.new(math.ceil(math.avg(barArray1.get(2).low.index, barArray1.get(0).high.index)), math.avg(zoneTop02, zoneBtm02), bar_index + 1, math.avg(zoneTop02, zoneBtm02), style=line.style_dotted, color=color.new(fvgCs1, 25)),
+        line.new(barArray1.get(0).high.index, zoneBtm02, bar_index + 1, zoneBtm02, color=color.new(fvgCs1, 65)),
+        fvgFill1 == "Midpoint Reached" ? math.avg(zoneTop02, zoneBtm02) : fvgFill1 == "Any Touch" ? zoneBtm02 : zoneTop02,
+        0,
+        fvgTf1 ? "Chart(" + tf1 + ") FVG" : "HTF(" + tf1 + ") FVG",
+        zoneTop02, zoneBtm02, "bearish", "HTF1", 0, 0.0, false, bar_index,
+        false, false, na
+     )
+    bearFvgArray1.unshift(fvg02)
+    first1b = bearFvgArray1.first()
+    linefill.new(first1b.lnTop, first1b.lnBtm, color.new(fvgCs1, 89))
+    trimFvgArray(bearFvgArray1, maxFvgKeep)
+
+updateFvg(bullFvgArray1, fvgFill1, "bull", nfvgLB1, "HTF1", tf1)
+updateFvg(bearFvgArray1, fvgFill1, "bear", nfvgLB1, "HTF1", tf1)
+checkDeepPenetration(bullFvgArray1, true, "HTF1")
+checkDeepPenetration(bearFvgArray1, false, "HTF1")
+
+// ============================================================================
+// FVG DETECTION  SLOT 2 (Daily)
+// ============================================================================
+string tf2 = htfTF("1 Day")
+bool fvgTf2 = tf2 == timeframe.period
+if timeframe.change(tf2)
+    bullProcess2 := false
+    bearProcess2 := false
+    if barArray2.size() > 2
+        barArray2.pop()
+    barArray2.unshift(barHist2)
+    // --- Weekend / session gap detection (HTF2) ---
+    float prevClose2 = barClose2.price
+    float gapSize2 = math.abs(open - prevClose2)
+    if gapSize2 > syminfo.mintick * 20
+        if open > prevClose2
+            float gTop2 = open
+            float gBtm2 = prevClose2
+            fvgG2 = FVG.new(
+                label.new(bar_index + 1, math.avg(gTop2, gBtm2), nfvgLB2 == "Show" ? (fvgTf2 ? "Chart(" + tf2 + ") GAP" : "HTF(" + tf2 + ") GAP") : "", xloc.bar_index, color=noColor, style=label.style_label_left, textcolor=fvgCb2, size=size.small,
+                 tooltip=(fvgTf2 ? "Chart(" + tf2 + ") Bullish Gap" : "HTF(" + tf2 + ") Bullish Gap") + "\n\nZone Top " + str.format("{0, number, #,###.##}", gTop2) + "\nZone Mid " + str.format("{0, number, #,###.##}", math.avg(gTop2, gBtm2)) + "\nZone Btm " + str.format("{0, number, #,###.##}", gBtm2)),
+                line.new(bar_index, gTop2, bar_index + 1, gTop2, color=color.new(fvgCb2, 65)),
+                line.new(bar_index, math.avg(gTop2, gBtm2), bar_index + 1, math.avg(gTop2, gBtm2), style=line.style_dotted, color=color.new(fvgCb2, 25)),
+                line.new(bar_index, gBtm2, bar_index + 1, gBtm2, color=color.new(fvgCb2, 50), width=2),
+                fvgFill2 == "Midpoint Reached" ? math.avg(gTop2, gBtm2) : fvgFill2 == "Any Touch" ? gTop2 : gBtm2,
+                0,
+                fvgTf2 ? "Chart(" + tf2 + ") GAP" : "HTF(" + tf2 + ") GAP",
+                gTop2, gBtm2, "bullish", "HTF2", 0, 0.0, false, bar_index,
+                false, false, na
+             )
+            bullFvgArray2.unshift(fvgG2)
+            firstG2 = bullFvgArray2.first()
+            linefill.new(firstG2.lnTop, firstG2.lnBtm, color.new(fvgCb2, 89))
+            trimFvgArray(bullFvgArray2, maxFvgKeep)
+        else
+            float gTop2b = prevClose2
+            float gBtm2b = open
+            fvgG2b = FVG.new(
+                label.new(bar_index + 1, math.avg(gTop2b, gBtm2b), nfvgLB2 == "Show" ? (fvgTf2 ? "Chart(" + tf2 + ") GAP" : "HTF(" + tf2 + ") GAP") : "", xloc.bar_index, color=noColor, style=label.style_label_left, textcolor=fvgCs2, size=size.small,
+                 tooltip=(fvgTf2 ? "Chart(" + tf2 + ") Bearish Gap" : "HTF(" + tf2 + ") Bearish Gap") + "\n\nZone Top " + str.format("{0, number, #,###.##}", gTop2b) + "\nZone Mid " + str.format("{0, number, #,###.##}", math.avg(gTop2b, gBtm2b)) + "\nZone Btm " + str.format("{0, number, #,###.##}", gBtm2b)),
+                line.new(bar_index, gTop2b, bar_index + 1, gTop2b, color=color.new(fvgCs2, 50), width=2),
+                line.new(bar_index, math.avg(gTop2b, gBtm2b), bar_index + 1, math.avg(gTop2b, gBtm2b), style=line.style_dotted, color=color.new(fvgCs2, 25)),
+                line.new(bar_index, gBtm2b, bar_index + 1, gBtm2b, color=color.new(fvgCs2, 65)),
+                fvgFill2 == "Midpoint Reached" ? math.avg(gTop2b, gBtm2b) : fvgFill2 == "Any Touch" ? gBtm2b : gTop2b,
+                0,
+                fvgTf2 ? "Chart(" + tf2 + ") GAP" : "HTF(" + tf2 + ") GAP",
+                gTop2b, gBtm2b, "bearish", "HTF2", 0, 0.0, false, bar_index,
+                false, false, na
+             )
+            bearFvgArray2.unshift(fvgG2b)
+            firstG2b = bearFvgArray2.first()
+            linefill.new(firstG2b.lnTop, firstG2b.lnBtm, color.new(fvgCs2, 89))
+            trimFvgArray(bearFvgArray2, maxFvgKeep)
+    barOpen2  := HTFBar.new(open, bar_index)
+    barHigh2  := HTFBar.new(high, bar_index)
+    barLow2   := HTFBar.new(low, bar_index)
+    barClose2 := HTFBar.new(close, bar_index)
+    barHist2  := HTFBarOHLC.new(barOpen2, barHigh2, barLow2, barClose2)
+    bullBarIndexEnd2_1 := bullBarIndexEnd2
+    bullBarIndexEnd2  := bar_index
+    bearBarIndexEnd2_1 := bearBarIndexEnd2
+    bearBarIndexEnd2  := bar_index
+else
+    if high > barHigh2.price
+        barHigh2.price := high
+        barHigh2.index := bar_index
+    if low < barLow2.price
+        barLow2.price := low
+        barLow2.index := bar_index
+    barClose2.price := close
+    barClose2.index := bar_index
+    barHist2 := HTFBarOHLC.new(barOpen2, barHigh2, barLow2, barClose2)
+    if barArray2.size() > 2
+        if low < barArray2.get(1).high.price
+            bullBarIndexEnd2 := bar_index
+        if high > barArray2.get(1).low.price
+            bearBarIndexEnd2 := bar_index
+
+if barArray2.size() > 2
+    float minGap2 = syminfo.mintick * minFvgPips * 10
+    // Bullish FVG
+    bool bullGap2 = barArray2.get(1).low.price > barArray2.get(2).high.price and barArray2.get(0).low.price > barArray2.get(2).high.price
+    bool bullZoneOk2 = barArray2.get(0).low.price > barArray2.get(2).high.price
+    bullCondition2 := bullGap2 and bullZoneOk2 and (barArray2.get(1).low.price - barArray2.get(2).high.price) >= minGap2
+    // Bearish FVG
+    bool bearGap2 = barArray2.get(1).high.price < barArray2.get(2).low.price and barArray2.get(0).high.price < barArray2.get(2).low.price
+    bool bearZoneOk2 = barArray2.get(0).high.price < barArray2.get(2).low.price
+    bearCondition2 := bearGap2 and bearZoneOk2 and (barArray2.get(2).low.price - barArray2.get(1).high.price) >= minGap2
+
+if bullCondition2 and not bullProcess2
+    bullProcess2 := true
+    float zoneTop11 = barArray2.get(0).low.price
+    float zoneBtm11 = barArray2.get(2).high.price
+    fvg11 = FVG.new(
+        label.new(bar_index + 1, math.avg(zoneTop11, zoneBtm11), nfvgLB2 == "Show" ? (fvgTf2 ? "Chart(" + tf2 + ") FVG" : "HTF(" + tf2 + ") FVG") : "", xloc.bar_index, color=noColor, style=label.style_label_left, textcolor=fvgCb2, size=size.small,
+         tooltip=(fvgTf2 ? "Chart(" + tf2 + ") Bullish FVG" : "HTF(" + tf2 + ") Bullish FVG") + "\n\nZone Top " + str.format("{0, number, #,###.##}", zoneTop11) + "\nZone Mid " + str.format("{0, number, #,###.##}", math.avg(zoneTop11, zoneBtm11)) + "\nZone Btm " + str.format("{0, number, #,###.##}", zoneBtm11)),
+        line.new(barArray2.get(0).low.index, zoneTop11, bar_index + 1, zoneTop11, color=color.new(fvgCb2, 65)),
+        line.new(math.ceil(math.avg(barArray2.get(0).low.index, barArray2.get(2).high.index)), math.avg(zoneTop11, zoneBtm11), bar_index + 1, math.avg(zoneTop11, zoneBtm11), style=line.style_dotted, color=color.new(fvgCb2, 25)),
+        line.new(barArray2.get(2).high.index, zoneBtm11, bar_index + 1, zoneBtm11, color=color.new(fvgCb2, 50), width=2),
+        fvgFill2 == "Midpoint Reached" ? math.avg(zoneTop11, zoneBtm11) : fvgFill2 == "Any Touch" ? zoneTop11 : zoneBtm11,
+        0,
+        fvgTf2 ? "Chart(" + tf2 + ") FVG" : "HTF(" + tf2 + ") FVG",
+        zoneTop11, zoneBtm11, "bullish", "HTF2", 0, 0.0, false, bar_index,
+        false, false, na
+     )
+    bullFvgArray2.unshift(fvg11)
+    first2 = bullFvgArray2.first()
+    linefill.new(first2.lnTop, first2.lnBtm, color.new(fvgCb2, 89))
+    trimFvgArray(bullFvgArray2, maxFvgKeep)
+
+if bearCondition2 and not bearProcess2
+    bearProcess2 := true
+    float zoneTop12 = barArray2.get(2).low.price
+    float zoneBtm12 = barArray2.get(0).high.price
+    fvg12 = FVG.new(
+        label.new(bar_index + 1, math.avg(zoneTop12, zoneBtm12), nfvgLB2 == "Show" ? (fvgTf2 ? "Chart(" + tf2 + ") FVG" : "HTF(" + tf2 + ") FVG") : "", xloc.bar_index, color=noColor, style=label.style_label_left, textcolor=fvgCs2, size=size.small,
+         tooltip=(fvgTf2 ? "Chart(" + tf2 + ") Bearish FVG" : "HTF(" + tf2 + ") Bearish FVG") + "\n\nZone Top " + str.format("{0, number, #,###.##}", zoneTop12) + "\nZone Mid " + str.format("{0, number, #,###.##}", math.avg(zoneTop12, zoneBtm12)) + "\nZone Btm " + str.format("{0, number, #,###.##}", zoneBtm12)),
+        line.new(barArray2.get(2).low.index, zoneTop12, bar_index + 1, zoneTop12, color=color.new(fvgCs2, 50), width=2),
+        line.new(math.ceil(math.avg(barArray2.get(2).low.index, barArray2.get(0).high.index)), math.avg(zoneTop12, zoneBtm12), bar_index + 1, math.avg(zoneTop12, zoneBtm12), style=line.style_dotted, color=color.new(fvgCs2, 25)),
+        line.new(barArray2.get(0).high.index, zoneBtm12, bar_index + 1, zoneBtm12, color=color.new(fvgCs2, 65)),
+        fvgFill2 == "Midpoint Reached" ? math.avg(zoneTop12, zoneBtm12) : fvgFill2 == "Any Touch" ? zoneBtm12 : zoneTop12,
+        0,
+        fvgTf2 ? "Chart(" + tf2 + ") FVG" : "HTF(" + tf2 + ") FVG",
+        zoneTop12, zoneBtm12, "bearish", "HTF2", 0, 0.0, false, bar_index,
+        false, false, na
+     )
+    bearFvgArray2.unshift(fvg12)
+    first2b = bearFvgArray2.first()
+    linefill.new(first2b.lnTop, first2b.lnBtm, color.new(fvgCs2, 89))
+    trimFvgArray(bearFvgArray2, maxFvgKeep)
+
+updateFvg(bullFvgArray2, fvgFill2, "bull", nfvgLB2, "HTF2", tf2)
+updateFvg(bearFvgArray2, fvgFill2, "bear", nfvgLB2, "HTF2", tf2)
+checkDeepPenetration(bullFvgArray2, true, "HTF2")
+checkDeepPenetration(bearFvgArray2, false, "HTF2")
+
+// ============================================================================
+// NO-WICK OPEN ARROWS — clean, independent No-Wick signals
+// ============================================================================
+bullishNoWick = (close > open) and (open == low)
+bearishNoWick = (close < open) and (open == high)
+
+plotshape(showNoWick and bullishNoWick and arrowSizeStr == "Small", style=shape.triangleup, location=location.belowbar, color=bullArrowColor, size=size.small)
+plotshape(showNoWick and bearishNoWick and arrowSizeStr == "Small", style=shape.triangledown, location=location.abovebar, color=bearArrowColor, size=size.small)
+plotshape(showNoWick and bullishNoWick and arrowSizeStr == "Normal", style=shape.triangleup, location=location.belowbar, color=bullArrowColor, size=size.normal)
+plotshape(showNoWick and bearishNoWick and arrowSizeStr == "Normal", style=shape.triangledown, location=location.abovebar, color=bearArrowColor, size=size.normal)
+
+alertcondition(bullishNoWick, title="Bullish No-Wick Arrow", message="Bullish No-Wick Open detected")
+alertcondition(bearishNoWick, title="Bearish No-Wick Arrow", message="Bearish No-Wick Open detected")
+
+// Helper: convert internal trend int to string for webhook
+string currentTrendStr = trend == 1 ? "bullish" : trend == -1 ? "bearish" : "neutral"
+
+// --- Bullish No-Wick: CLEAN alert (No-Wick ONLY) ---
+if bullishNoWick and shouldSendWebhook(enableWebhooks) and sendWicklessEvents
+    string wicklessPayloadBull = buildWicklessWebhook("bullish", low, lastHigh, lastLow, currentTrendStr)
+    alert(wicklessPayloadBull, alert.freq_once_per_bar_close)
+    if enableReplayBridge
+        alert(buildReplayBridgeWrapper(wicklessPayloadBull), alert.freq_once_per_bar_close)
+
+// --- Bearish No-Wick: CLEAN alert (No-Wick ONLY) ---
+if bearishNoWick and shouldSendWebhook(enableWebhooks) and sendWicklessEvents
+    string wicklessPayloadBear = buildWicklessWebhook("bearish", high, lastHigh, lastLow, currentTrendStr)
+    alert(wicklessPayloadBear, alert.freq_once_per_bar_close)
+    if enableReplayBridge
+        alert(buildReplayBridgeWrapper(wicklessPayloadBear), alert.freq_once_per_bar_close)
+
+
+// ============================================================================
+// PERIODIC STRUCTURE SNAPSHOT (every 15 minutes)
+// Sends last 5 BOS/ChoCh events independently — NOT baked into No-Wick
+// ============================================================================
+var int lastStructSnapshotTimeMs = na
+bool shouldSendStructSnapshot = shouldSendWebhook(enableWebhooks) and barstate.isconfirmed
+bool structSnapshotReady = shouldSendStructSnapshot and (na(lastStructSnapshotTimeMs) or (time - lastStructSnapshotTimeMs) >= 900000)
+
+buildStructureSnapshotJson() =>
+    string structSnapJson = buildStructHistoryJson(structHistory)
+    '{"source":"structure","event":"structure_snapshot","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","bar_time":' + str.tostring(time) + ',"recent_structure":' + structSnapJson + '}'
+
+alertcondition(structSnapshotReady, title="Structure Snapshot (15min)", message="structure_snapshot")
+
+if shouldSendStructSnapshot and structSnapshotReady
+    string structPayloadStr = buildStructureSnapshotJson()
+    lastStructSnapshotTimeMs := time
+    alert(structPayloadStr, alert.freq_once_per_bar_close)
+    if enableReplayBridge
+        alert(buildReplayBridgeWrapper(structPayloadStr), alert.freq_once_per_bar_close)
+
+// ============================================================================
+// PERIODIC FVG STATE SNAPSHOT (every 15 minutes real-time)
+// Sends ALL active FVGs to server cache regardless of No-Wick
+// EA polls this via GET /api/fvg-periodic-updates
+// ============================================================================
+var string lastFvgSnapshotChecksum = ""
+var int lastSnapshotTimeMs = na
+if shouldSendWebhook(enableWebhooks) and barstate.isconfirmed
+    int currentTimeMs = time
+    if na(lastSnapshotTimeMs) or currentTimeMs - lastSnapshotTimeMs >= 900000  // 15 minutes in milliseconds
+        array.clear(fvgEntries)
+        collectFvgEntries(bullFvgArray1, tf1, fvgEntries)
+        collectFvgEntries(bearFvgArray1, tf1, fvgEntries)
+        collectFvgEntries(bullFvgArray2, tf2, fvgEntries)
+        collectFvgEntries(bearFvgArray2, tf2, fvgEntries)
+        // Append any invalidated FVGs since last webhook
+        int invCount = array.size(invalidatedFvgJsons)
+        if invCount > 0
+            for i = 0 to invCount - 1
+                array.push(fvgEntries, array.get(invalidatedFvgJsons, i))
+        string fvgSnapJson = buildFvgJson(fvgEntries)
+        // Always send every 15 minutes regardless of changes
+        string fvgPayloadStr = '{"source":"fvg","event":"fvg_snapshot","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","bar_time":' + str.tostring(time) + ',"count":' + str.tostring(array.size(fvgEntries)) + ',"active_count":' + str.tostring(array.size(fvgEntries) - invCount) + ',"invalidated_count":' + str.tostring(invCount) + ',"fvgs":' + fvgSnapJson + '}'
+        alert(fvgPayloadStr, alert.freq_once_per_bar_close)
+        if enableReplayBridge
+            alert(buildReplayBridgeWrapper(fvgPayloadStr), alert.freq_once_per_bar_close)
+        lastFvgSnapshotChecksum := fvgSnapJson
+        lastSnapshotTimeMs := currentTimeMs
+        // Only clear invalidated tracker when snapshot fires (guaranteed delivery)
+        if invCount > 0
+            array.clear(invalidatedFvgJsons)
+
+// ============================================================================
+// RISK DASHBOARD
+// ============================================================================
+var table riskTable = table.new(position.top_right, 2, 3, bgcolor=color.new(#1e222d, 0), border_color=color.new(#787b86, 0), border_width=1, frame_color=color.new(#787b86, 0), frame_width=1)
+
+if showRiskDash and barstate.islast
+    string lblSize = size.small
+    string valSize = size.normal
+    float actualRiskAmount = (accountBal * riskPercent / 100)
+    float contractSize = 1
+    if syminfo.type == "forex"
+        contractSize := 100000
+    else if str.contains(syminfo.ticker, "XAU") or str.contains(syminfo.ticker, "GOLD")
+        contractSize := 100
+    else if str.contains(syminfo.ticker, "XAG") or str.contains(syminfo.ticker, "SILVER")
+        contractSize := 5000
+    float pipValueInQuote = contractSize * getPipSize(goldPipMode, silverPipMode)
+    float exchangeRate = 1.0
+    if accountCurr != syminfo.currency
+        string crossTicker = "FX_IDC:" + accountCurr + syminfo.currency
+        float crossRate = request.security(crossTicker, timeframe.period, close, ignore_invalid_symbol=true)
+        if not na(crossRate)
+            exchangeRate := crossRate
+        else
+            float fallbackRate = request.security(accountCurr + syminfo.currency, timeframe.period, close, ignore_invalid_symbol=true)
+            if not na(fallbackRate)
+                exchangeRate := fallbackRate
+            else if str.startswith(syminfo.ticker, accountCurr) and str.endswith(syminfo.ticker, syminfo.currency)
+                exchangeRate := close
+    float currentPipValue = pipValueInQuote / exchangeRate
+    lotSize = actualRiskAmount / (slPips * currentPipValue)
+    string riskDisplayStr = str.tostring(riskPercent) + "% (" + str.tostring(actualRiskAmount, "#.##") + " " + accountCurr + ")"
+    table.cell(riskTable, 0, 0, "Risk (%)", text_color=color.white, text_size=lblSize, bgcolor=color.new(#1e222d, 0))
+    table.cell(riskTable, 1, 0, riskDisplayStr, text_color=color.white, text_size=lblSize, bgcolor=color.new(#1e222d, 0))
+    table.cell(riskTable, 0, 1, "Stop Loss (Pips)", text_color=color.white, text_size=lblSize, bgcolor=color.new(#1e222d, 0))
+    table.cell(riskTable, 1, 1, str.tostring(slPips), text_color=color.white, text_size=lblSize, bgcolor=color.new(#1e222d, 0))
+    table.cell(riskTable, 0, 2, "Lot Size", text_color=color.yellow, text_size=valSize, text_halign=text.align_center, bgcolor=color.new(#1e222d, 0))
+    table.cell(riskTable, 1, 2, str.tostring(lotSize, "#.##"), text_color=color.yellow, text_size=valSize, text_halign=text.align_center, bgcolor=color.new(#1e222d, 0))
+else if not showRiskDash and barstate.islast
+    table.clear(riskTable, 0, 0, 1, 2)
+
+// ============================================================================
+// MANUAL BACKTEST DASHBOARD
+// ============================================================================
+string btPos = showRiskDash ? position.bottom_right : position.top_right
+var table btTable = table.new(btPos, 2, 5, border_width = 1, border_color = color.new(#787b86, 50), frame_color=color.new(#787b86, 50), frame_width=1)
+
+if showBacktest and barstate.islast
+    string btTextSize = size.normal
+    int totalTrades = btWins + btLosses
+    float winRate = totalTrades > 0 ? (btWins / totalTrades) * 100 : 0
+    color bgColor   = color.new(#1e222d, 0)
+    color textColor = color.white
+    table.cell(btTable, 0, 0, "Metric", bgcolor=color.new(#2962ff, 40), text_color=textColor, text_halign=text.align_left, text_size=btTextSize)
+    table.cell(btTable, 1, 0, "Value",  bgcolor=color.new(#2962ff, 40), text_color=textColor, text_halign=text.align_center, text_size=btTextSize)
+    table.cell(btTable, 0, 1, "Total Trades", bgcolor=bgColor, text_color=textColor, text_halign=text.align_left, text_size=btTextSize)
+    table.cell(btTable, 1, 1, str.tostring(totalTrades), bgcolor=bgColor, text_color=textColor, text_halign=text.align_center, text_size=btTextSize)
+    table.cell(btTable, 0, 2, "Wins", bgcolor=bgColor, text_color=textColor, text_halign=text.align_left, text_size=btTextSize)
+    table.cell(btTable, 1, 2, str.tostring(btWins), bgcolor=bgColor, text_color=color.green, text_halign=text.align_center, text_size=btTextSize)
+    table.cell(btTable, 0, 3, "Losses", bgcolor=bgColor, text_color=textColor, text_halign=text.align_left, text_size=btTextSize)
+    table.cell(btTable, 1, 3, str.tostring(btLosses), bgcolor=bgColor, text_color=color.red, text_halign=text.align_center, text_size=btTextSize)
+    color wrColor = winRate >= 50 ? color.green : color.red
+    table.cell(btTable, 0, 4, "Win Rate", bgcolor=bgColor, text_color=textColor, text_halign=text.align_left, text_size=btTextSize)
+    table.cell(btTable, 1, 4, str.tostring(winRate, "#.##") + "%", bgcolor=bgColor, text_color=wrColor, text_halign=text.align_center, text_size=btTextSize)
+else if not showBacktest and barstate.islast
+    table.clear(btTable, 0, 0, 1, 4)
+
+// ============================================================================
+// CLEANUP invalidated FVGs from arrays (drawings removed, JSON already sent)
+// ============================================================================
+cleanupBreakConfirmedFvgs(bullFvgArray1)
+cleanupBreakConfirmedFvgs(bearFvgArray1)
+cleanupBreakConfirmedFvgs(bullFvgArray2)
+cleanupBreakConfirmedFvgs(bearFvgArray2)

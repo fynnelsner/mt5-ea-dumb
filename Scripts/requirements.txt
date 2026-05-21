@@ -1,0 +1,28 @@
+# DevyyTrades MT5 Webhook Server Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core (usually included with Python)
+# - json
+# - os
+# - sys
+# - time
+# - logging
+# - datetime
+# - pathlib
+# - http.server
+# - urllib.parse
+# - threading
+# - hashlib
+# - hmac
+
+# Optional - for testing
+requests>=2.28.0
+
+# Optional - for cloud deployment
+# flask>=2.0.0  # If using Flask instead of http.server
+# gunicorn>=20.0.0  # For production server
+# waitress>=2.1.0  # Alternative production server
+
+# Optional - for monitoring
+# psutil>=5.9.0  # System monitoring
+# prometheus-client>=0.14.0  # Metrics

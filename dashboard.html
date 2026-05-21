@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>DevyyTrades Companion</title>
+  <style>
+    :root {
+      --bg: #0a0a0a;
+      --bg-elevated: #111111;
+      --bg-card: #161616;
+      --border: #222222;
+      --text: #f5f5f5;
+      --text-muted: #888888;
+      --red: #ef4444;
+      --red-dim: #7f1d1d;
+      --green: #22c55e;
+      --green-dim: #14532d;
+      --amber: #f59e0b;
+      --accent: #dc2626;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      height: 100%;
+      overflow-x: hidden;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .app { max-width: 480px; margin: 0 auto; min-height: 100vh; padding-bottom: 80px; }
+    
+    /* Header */
+    .header {
+      padding: 20px 16px 12px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(220,38,38,0.08) 0%, transparent 100%);
+    }
+    .header h1 {
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      background: linear-gradient(135deg, #fff 0%, var(--red) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .header p { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+    
+    /* Status Card */
+    .status-card {
+      margin: 16px;
+      padding: 16px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      position: relative;
+      overflow: hidden;
+    }
+    .status-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 3px;
+      background: linear-gradient(90deg, var(--red), var(--accent));
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .status-row:last-child { border-bottom: none; }
+    .status-label { font-size: 13px; color: var(--text-muted); }
+    .status-value {
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      box-shadow: 0 0 6px currentColor;
+    }
+    .dot.online { background: var(--green); color: var(--green); }
+    .dot.offline { background: var(--red); color: var(--red); }
+    .dot.warn { background: var(--amber); color: var(--amber); }
+    
+    /* Buttons */
+    .btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      padding: 14px;
+      border-radius: 12px;
+      border: none;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+      margin-top: 12px;
+    }
+    .btn:active { transform: scale(0.97); }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), var(--red));
+      color: white;
+      box-shadow: 0 4px 20px rgba(220,38,38,0.3);
+    }
+    .btn-secondary {
+      background: var(--bg-elevated);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-danger {
+      background: linear-gradient(135deg, var(--red-dim), var(--red));
+      color: white;
+    }
+    
+    /* Section */
+    .section {
+      margin: 16px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+    }
+    .section-header {
+      padding: 14px 16px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .section-header .badge {
+      background: var(--red);
+      color: white;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+    }
+    
+    /* Webhook Event Item */
+    .event-item {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+    }
+    .event-item:last-child { border-bottom: none; }
+    .event-pair {
+      font-weight: 700;
+      font-size: 14px;
+    }
+    .event-type {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+    .event-dir {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 10px;
+      border-radius: 6px;
+      text-transform: uppercase;
+    }
+    .dir-bull { background: var(--green-dim); color: var(--green); }
+    .dir-bear { background: var(--red-dim); color: var(--red); }
+    .event-time {
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+    
+    /* Logs */
+    .log-item {
+      padding: 8px 16px;
+      font-size: 11px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .log-item:last-child { border-bottom: none; }
+    .log-item span.time { color: var(--red); margin-right: 6px; }
+    
+    /* Account Stats */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      background: var(--border);
+    }
+    .stat-cell {
+      background: var(--bg-card);
+      padding: 14px;
+      text-align: center;
+    }
+    .stat-value {
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--text);
+    }
+    .stat-label {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+    .stat-up { color: var(--green); }
+    .stat-down { color: var(--red); }
+    
+    /* Loading */
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+    .spinner {
+      width: 24px; height: 24px;
+      border: 2px solid var(--border);
+      border-top-color: var(--red);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    
+    /* Bottom nav */
+    .bottom-nav {
+      position: fixed;
+      bottom: 0; left: 0; right: 0;
+      background: rgba(10,10,10,0.92);
+      backdrop-filter: blur(20px);
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: space-around;
+      padding: 8px 0 calc(8px + env(safe-area-inset-bottom));
+      z-index: 100;
+    }
+    .nav-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+      padding: 6px 16px;
+      color: var(--text-muted);
+      font-size: 10px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      background: none;
+      transition: color 0.15s;
+    }
+    .nav-item.active { color: var(--red); }
+    .nav-icon {
+      width: 24px; height: 24px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    
+    .hidden { display: none !important; }
+    
+    /* Pull to refresh hint */
+    .refresh-hint {
+      text-align: center;
+      padding: 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    
+    /* Animations */
+    .fade-in { animation: fadeIn 0.3s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <div class="header">
+      <h1>DevyyTrades</h1>
+      <p>EA Companion v1.0</p>
+    </div>
+
+    <!-- STATUS TAB -->
+    <div id="tab-status" class="tab-content">
+      <div class="status-card fade-in">
+        <div class="status-row">
+          <span class="status-label">MetaTrader 5</span>
+          <span class="status-value" id="mt5-status">
+            <span class="dot"></span> Checking...
+          </span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">Wine Server</span>
+          <span class="status-value" id="wine-status">
+            <span class="dot"></span> Checking...
+          </span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">Last Check</span>
+          <span class="status-value" id="last-check">--</span>
+        </div>
+        <div class="status-row">
+          <span class="status-label">Webhooks (24h)</span>
+          <span class="status-value" id="webhook-count">--</span>
+        </div>
+        <button class="btn btn-primary" onclick="refreshStatus()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <polyline points="23 4 23 10 17 10"></polyline>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+          </svg>
+          Refresh Status
+        </button>
+        <button class="btn btn-danger" onclick="alert('Restart not yet implemented. SSH to VPS and run: ./start_mt5.sh')">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M1 4v6h6"></path>
+            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path>
+          </svg>
+          Restart EA
+        </button>
+      </div>
+
+      <div class="section fade-in">
+        <div class="section-header">
+          Account Performance
+          <span class="badge">LIVE</span>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-cell">
+            <div class="stat-value stat-up">+0.00%</div>
+            <div class="stat-label">Today's PnL</div>
+          </div>
+          <div class="stat-cell">
+            <div class="stat-value">--</div>
+            <div class="stat-label">Open Positions</div>
+          </div>
+          <div class="stat-cell">
+            <div class="stat-value">--</div>
+            <div class="stat-label">Win Rate</div>
+          </div>
+          <div class="stat-cell">
+            <div class="stat-value">--</div>
+            <div class="stat-label">Total Trades</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- WEBHOOKS TAB -->
+    <div id="tab-webhooks" class="tab-content hidden">
+      <div class="refresh-hint">Pull down or tap refresh to reload</div>
+      <div class="section">
+        <div class="section-header">
+          Recent Signals
+          <span class="badge" id="signal-badge">0</span>
+        </div>
+        <div id="events-list">
+          <div class="loading">
+            <div class="spinner"></div>
+            Loading webhooks...
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- LOGS TAB -->
+    <div id="tab-logs" class="tab-content hidden">
+      <div class="section">
+        <div class="section-header">EA Logs</div>
+        <div id="logs-list">
+          <div class="loading">
+            <div class="spinner"></div>
+            Loading logs...
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom Nav -->
+    <div class="bottom-nav">
+      <button class="nav-item active" onclick="showTab('status')">
+        <div class="nav-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="7" height="7" rx="1"></rect>
+            <rect x="14" y="3" width="7" height="7" rx="1"></rect>
+            <rect x="14" y="14" width="7" height="7" rx="1"></rect>
+            <rect x="3" y="14" width="7" height="7" rx="1"></rect>
+          </svg>
+        </div>
+        Status
+      </button>
+      <button class="nav-item" onclick="showTab('webhooks')">
+        <div class="nav-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>
+          </svg>
+        </div>
+        Signals
+      </button>
+      <button class="nav-item" onclick="showTab('logs')">
+        <div class="nav-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+          </svg>
+        </div>
+        Logs
+      </button>
+    </div>
+  </div>
+
+  <script>
+    // CONFIG - Update this with your VPS IP/domain
+    const API_BASE = '/companion/api';
+    
+    // If opened from same network as VPS, try localhost fallback
+    const API_FALLBACK = '/companion/api';
+    
+    let currentApi = API_BASE;
+    
+    function showTab(tab) {
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+      document.getElementById('tab-' + tab).classList.remove('hidden');
+      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+      event.target.closest('.nav-item').classList.add('active');
+      
+      if (tab === 'webhooks') loadWebhooks();
+      if (tab === 'logs') loadLogs();
+    }
+    
+    async function apiGet(endpoint) {
+      try {
+        let res = await fetch(currentApi + endpoint, { method: 'GET', mode: 'cors' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return await res.json();
+      } catch (e) {
+        // Try fallback
+        if (currentApi !== API_FALLBACK) {
+          currentApi = API_FALLBACK;
+          return await apiGet(endpoint);
+        }
+        throw e;
+      }
+    }
+    
+    async function refreshStatus() {
+      const mt5El = document.getElementById('mt5-status');
+      const wineEl = document.getElementById('wine-status');
+      const checkEl = document.getElementById('last-check');
+      const countEl = document.getElementById('webhook-count');
+      
+      mt5El.innerHTML = '<span class="dot warn"></span> Checking...';
+      wineEl.innerHTML = '<span class="dot warn"></span> Checking...';
+      
+      try {
+        const data = await apiGet('/api/status');
+        
+        const sys = data.system || {};
+        mt5El.innerHTML = sys.mt5_running 
+          ? '<span class="dot online"></span> Online'
+          : '<span class="dot offline"></span> OFFLINE';
+        wineEl.innerHTML = sys.wine_running
+          ? '<span class="dot online"></span> Online'
+          : '<span class="dot offline"></span> OFFLINE';
+        checkEl.textContent = sys.timestamp ? new Date(sys.timestamp).toLocaleTimeString() : 'Now';
+        countEl.textContent = data.webhooks_last_24h || '0';
+        
+        // Show notification if offline
+        if (!sys.mt5_running && 'Notification' in window) {
+          Notification.requestPermission().then(p => {
+            if (p === 'granted') {
+              new Notification('DevyyTrades Alert', {
+                body: 'MetaTrader 5 is OFFLINE!',
+                icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">📉</text></svg>'
+              });
+            }
+          });
+        }
+      } catch (e) {
+        mt5El.innerHTML = '<span class="dot offline"></span> Cannot reach API';
+        wineEl.innerHTML = '<span class="dot offline"></span> Cannot reach API';
+        checkEl.textContent = 'Error';
+      }
+    }
+    
+    async function loadWebhooks() {
+      const list = document.getElementById('events-list');
+      try {
+        const data = await apiGet('/api/webhooks?limit=20');
+        const events = data.events || [];
+        document.getElementById('signal-badge').textContent = events.length;
+        
+        if (events.length === 0) {
+          list.innerHTML = '<div class="loading">No recent signals</div>';
+          return;
+        }
+        
+        list.innerHTML = events.map((e, i) => {
+          const body = e.data || e;
+          const dir = body.direction || body.candle_type || '?';
+          const isBull = dir.toLowerCase().includes('bull');
+          const pair = e.symbol || '?';
+          const tf = e.timeframe || '?';
+          const time = e.received_at ? new Date(e.received_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : '?';
+          
+          return `
+            <div class="event-item fade-in" style="animation-delay: ${i * 0.03}s">
+              <div>
+                <div class="event-pair">${pair}</div>
+                <div class="event-type">No-Wick ${tf}m</div>
+                <div class="event-time">${time}</div>
+              </div>
+              <div>
+                <span class="event-dir ${isBull ? 'dir-bull' : 'dir-bear'}">${isBull ? 'BUY' : 'SELL'}</span>
+              </div>
+            </div>
+          `;
+        }).join('');
+      } catch (e) {
+        list.innerHTML = '<div class="loading">Failed to load signals. Check API connection.</div>';
+      }
+    }
+    
+    async function loadLogs() {
+      const list = document.getElementById('logs-list');
+      try {
+        const data = await apiGet('/api/logs?limit=30');
+        const logs = data.logs || [];
+        
+        if (logs.length === 0) {
+          list.innerHTML = '<div class="loading">No logs available</div>';
+          return;
+        }
+        
+        list.innerHTML = logs.map((log, i) => {
+          const parts = log.split(' | ');
+          const time = parts[0] || '';
+          const msg = parts.slice(1).join(' | ') || log;
+          return `<div class="log-item fade-in" style="animation-delay: ${i * 0.02}s"><span class="time">${time}</span>${msg}</div>`;
+        }).join('');
+      } catch (e) {
+        list.innerHTML = '<div class="loading">Failed to load logs</div>';
+      }
+    }
+    
+    // Auto-refresh status every 30 seconds
+    setInterval(() => {
+      if (!document.getElementById('tab-status').classList.contains('hidden')) {
+        refreshStatus();
+      }
+    }, 30000);
+    
+    // Initial load
+    refreshStatus();
+    
+    // Request notification permission
+    if ('Notification' in window) {
+      Notification.requestPermission();
+    }
+  </script>
+</body>
+</html>

@@ -249,12 +249,12 @@ double GetDivergence(string sym, double twOpen, long barTimeMs)
    
    Print("[EA_Dumb] GetDivergence: ", sym, " TW_open=", twOpen, " MT5_open=", mt5Open, " diff=", divergence);
    
-   // Sanity check: divergence should be reasonable (< 0.5% of price)
-   // If it's huge, something is wrong (wrong candle, data issue)
-   double maxDivergence = twOpen * 0.005;
+   // Sanity check: max 5 pips divergence. If more, use TW data as-is without adjustment.
+   double pipSize = (StringFind(sym, "JPY") >= 0) ? 0.01 : ((StringFind(sym, "XAU") >= 0) ? 0.01 : 0.0001);
+   double maxDivergence = 5 * pipSize;
    if(MathAbs(divergence) > maxDivergence)
      {
-      Print("[EA_Dumb] GetDivergence: divergence too large (", divergence, " > ", maxDivergence, "), ignoring");
+      Print("[EA_Dumb] GetDivergence: divergence > 5 pips (", divergence, "), using TW data without adjustment");
       return 0.0;
      }
    
@@ -426,13 +426,6 @@ bool PlaceOrder(string sym, string dir, double entry, double sl, double tp, stri
    // Backend lots field is IGNORED - EA has real-time balance, backend uses stale env var
    double lot = CalcLot(sym, MathAbs(entry - sl));
    Print("[EA_Dumb] Dynamic lot calc: ", lot, " for ", sym, " sl_dist=", MathAbs(entry - sl));
-   // NUCLEAR SAFETY CAP: never risk more than 5 lots
-   double MAX_LOT = 5.0;
-   if(lot > MAX_LOT)
-     {
-      Print("[EA_Dumb] LOT CAP TRIGGERED: ", lot, " capped to ", MAX_LOT, " for ", sym);
-      lot = MAX_LOT;
-     }
 
    if(lot <= 0)
      {
@@ -448,23 +441,37 @@ bool PlaceOrder(string sym, string dir, double entry, double sl, double tp, stri
    req.deviation    = InpSlippage;
    req.magic        = InpMagicNumber;
    req.comment      = setupId;
-   req.type_filling = ORDER_FILLING_RETURN;
+   // Preserve original SL/TP distance (before any divergence adjustment)
+   double slDist = MathAbs(entry - sl);
+   double tpDist = MathAbs(entry - tp);
    
    if(useMarketOrder)
      {
-      // Use actual market price for SL/TP normalization
+      // CRITICAL: For market orders, SL/TP must be calculated RELATIVE to the fill price,
+      // not set as absolute levels from the proposal. The fill price differs from the
+      // adjusted entry, so absolute levels would give wrong SL/TP distances.
       double fillPrice = (dir == "buy") ? ask : bid;
-      double actualSlDist = MathAbs(fillPrice - sl);
-      double actualTpDist = MathAbs(fillPrice - tp);
       
+      // Recalculate lot based on ACTUAL risk (fill-to-SL distance, not entry-to-SL)
+      // This ensures 1% risk even when fill price differs from adjusted entry
+      double actualSl = (dir == "sell") ? fillPrice + slDist : fillPrice - slDist;
+      double actualTp = (dir == "sell") ? fillPrice - tpDist : fillPrice + tpDist;
+      
+      double actualLot = CalcLot(sym, MathAbs(fillPrice - actualSl));
+      Print("[EA_Dumb] Market order: fill=", fillPrice, " sl=", actualSl, " tp=", actualTp, " slDist=", slDist, " lot=", actualLot);
+      
+
       req.action = TRADE_ACTION_DEAL;
       req.type   = otype;
-      req.price  = (dir == "buy") ? ask : bid;
-      req.sl     = NormalizeDouble(sl, digits);
-      req.tp     = NormalizeDouble(tp, digits);
+      req.volume = NormalizeDouble(actualLot, 2);
+      req.price  = fillPrice;
+      req.sl     = NormalizeDouble(actualSl, digits);
+      req.tp     = NormalizeDouble(actualTp, digits);
      }
    else
      {
+      // Limit order: entry price is the limit level, SL/TP distances are from limit price
+      // Lot was already calculated on entry-SL distance before this block
       req.action = TRADE_ACTION_PENDING;
       req.type   = otype;
       req.price  = NormalizeDouble(entry, digits);
@@ -475,13 +482,24 @@ bool PlaceOrder(string sym, string dir, double entry, double sl, double tp, stri
    // Cancel any existing pending orders for this setup_id first
    CancelOrderBySetupId(setupId);
    
-   MqlTradeResult res = {};
-   if(!OrderSend(req, res))
+   // Try multiple filling modes (FOK, IOC, RETURN) - some brokers only support certain modes
+   int filling_modes[] = {ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN};
+   for(int fm=0; fm<3; fm++)
      {
-      Print("[EA_Dumb] OrderSend failed: ", GetLastError(), " retcode=", res.retcode);
-      return false;
+      req.type_filling = filling_modes[fm];
+      MqlTradeResult res = {};
+      ResetLastError();
+      if(OrderSend(req, res))
+        {
+         Print("[EA_Dumb] Order placed with filling mode ", fm, " (", req.type_filling, ") ticket=", res.order);
+         return true;
+        }
+      int err = GetLastError();
+      Print("[EA_Dumb] OrderSend failed (filling=", fm, "): err=", err, " retcode=", res.retcode);
+      Sleep(100);
      }
-   return true;
+   Print("[EA_Dumb] All filling modes failed for ", sym);
+   return false;
   }
 
 //+------------------------------------------------------------------+

@@ -148,7 +148,8 @@ void OnTimer()
          // Check expiry
          if(InpCheckExpiry && expires > 0 && TimeGMT() > expires)
            {
-            Print("[EA_Dumb] SKIP expired: ", setupId);
+            Print("[EA_Dumb] SKIP expired: ", setupId, " - cleaning up proposal");
+            PostExecute(setupId);
             SessionAdd(g_executedIds, g_executedCount, setupId);
             continue;
            }
@@ -159,7 +160,8 @@ void OnTimer()
          // Check if opposing position exists
          if(HasOpposingPosition(symbol, dir))
            {
-            Print("[EA_Dumb] SKIP opposing position: ", setupId);
+            Print("[EA_Dumb] SKIP opposing position: ", setupId, " - cleaning up proposal");
+            PostExecute(setupId);
             SessionAdd(g_executedIds, g_executedCount, setupId);
             continue;
            }
